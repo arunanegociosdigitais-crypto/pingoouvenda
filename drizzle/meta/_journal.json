@@ -1,0 +1,62 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1792363692352,
+      "tag": "0001_initial",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1792363692352,
+      "tag": "0002_create_sales_table",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1792445461026,
+      "tag": "0003_add_segment_to_sales",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1792446342854,
+      "tag": "0004_add_profile_and_niche",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1792447255797,
+      "tag": "0005_products_stock_and_niche_pages",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1792447901141,
+      "tag": "0006_accounts_trial_admin_resellers",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1792448301442,
+      "tag": "0007_account_logo",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1792453109632,
+      "tag": "0008_add_account_password_hash",
+      "breakpoints": true
+    }
+  ]
+}

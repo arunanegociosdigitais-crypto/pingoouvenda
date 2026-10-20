@@ -1,0 +1,329 @@
+@import "tailwindcss";
+@import "tailwindcss-safe-area";
+
+@theme {
+  --text-xs: 12px;
+  --text-xs--line-height: 16px;
+  --text-sm: 14px;
+  --text-sm--line-height: 20px;
+  --text-base: 16px;
+  --text-base--line-height: 24px;
+  --text-lg: 18px;
+  --text-lg--line-height: 28px;
+  --text-xl: 20px;
+  --text-xl--line-height: 28px;
+  --text-2xl: 24px;
+  --text-2xl--line-height: 32px;
+  --text-3xl: 30px;
+  --text-3xl--line-height: 36px;
+  --text-4xl: 36px;
+  --text-4xl--line-height: 40px;
+  --text-5xl: 48px;
+  --text-5xl--line-height: 52px;
+  /* Tipografia no padrão da referência: Geist, sem serifa, em tudo —
+     títulos, números e destaques. Nenhuma serifada. */
+  --font-sans: "Geist", "Geist Sans", "Helvetica Neue", Helvetica, Arial,
+    "Segoe UI", Roboto, system-ui, -apple-system, sans-serif;
+  --font-display: "Geist", "Geist Sans", "Helvetica Neue", Helvetica, Arial,
+    "Segoe UI", Roboto, system-ui, -apple-system, sans-serif;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+:root {
+  /* Tema da usuária: fundo escuro roxo quase preto com roxo vibrante
+     (violeta elétrico da referência), seções claras em lilás suave
+     alternando com as escuras. */
+  color-scheme: dark;
+  --bg: #0a0214;
+  --surface: #160a2b;
+  --surface-alt: #241243;
+  --text: #f4f4f6;
+  --dim: #a79cc9;
+  --border: #3e2566;
+  --accent: #7b2ff7;
+  --accent-vivid: #9d4edd;
+  --accent-ink: #ffffff;
+  --accent-2: #c77dff;
+  --pink: #e05a70;
+  --yellow: #f2b90c;
+  --chart-bar: #6d28b8;
+  --ink: #1b0b33;
+  --ink-text: #f4f4f6;
+  --danger: #e05a70;
+  --whatsapp: #25d366;
+  --whatsapp-dark: #128c7e;
+  /* Cartões claros (lilás suave) das seções claras */
+  --card-light: #f7f3fe;
+  --card-light-alt: #ede5fc;
+  --card-light-text: #1e0b38;
+  --card-light-dim: #5f4b8f;
+  --card-light-border: #ddd0f7;
+  /* Escala de cantos: 14px (campos/pequenos), 18px (cards), 28px (painéis). */
+  --radius-sm: 14px;
+  --radius: 18px;
+  --radius-lg: 18px;
+  --radius-xl: 28px;
+  /* Segunda metade dos títulos: gradiente roxo vibrante */
+  --tone: #c77dff;
+  --gradient-purple: linear-gradient(
+    92deg,
+    #e0aaff 0%,
+    #c77dff 28%,
+    #9d4edd 52%,
+    #7b2ff7 76%,
+    #5a189a 100%
+  );
+  --gradient-purple-strong: linear-gradient(
+    135deg,
+    #c77dff 0%,
+    #8b2ff7 45%,
+    #5a189a 100%
+  );
+  --space-surface: var(--surface);
+  --space-surface-alt: var(--surface-alt);
+  --space-muted: var(--dim);
+  --space-border: var(--border);
+  --space-accent: var(--accent);
+}
+
+/* ---------- topo: grade de pontinhos roxos + brilhos radiais ---------- */
+.hero-top {
+  position: relative;
+  isolation: isolate;
+  background-color: var(--bg);
+  background-image:
+    radial-gradient(640px 320px at 18% -4%, rgba(157, 78, 221, 0.32), transparent 62%),
+    radial-gradient(720px 360px at 86% 6%, rgba(123, 47, 247, 0.28), transparent 64%),
+    radial-gradient(520px 280px at 52% 34%, rgba(90, 24, 154, 0.2), transparent 66%),
+    radial-gradient(rgba(199, 125, 255, 0.34) 1.3px, transparent 1.4px);
+  background-size:
+    auto,
+    auto,
+    auto,
+    22px 22px;
+  background-position:
+    0 0,
+    0 0,
+    0 0,
+    0 0;
+}
+.hero-top::after {
+  content: "";
+  position: absolute;
+  inset: auto 0 0 0;
+  height: 140px;
+  z-index: -1;
+  background: linear-gradient(to bottom, transparent, var(--bg));
+  pointer-events: none;
+}
+
+/* Fundo pontilhado reutilizável em faixas escuras */
+.dot-grid {
+  background-image: radial-gradient(
+    rgba(199, 125, 255, 0.3) 1.3px,
+    transparent 1.4px
+  );
+  background-size: 22px 22px;
+}
+
+/* ---------- seções claras alternadas (Método / Benefícios / FAQ) ---------- */
+.section-light {
+  --text: #1e0b38;
+  --dim: #5f4b8f;
+  --border: #ddd0f7;
+  --surface: #ffffff;
+  --surface-alt: #efe8fd;
+  --chart-bar: #b794e8;
+  --tone: #7b2ff7;
+  background: #f2ecfd;
+  color: var(--text);
+}
+.section-light .font-accent-word {
+  background: linear-gradient(92deg, #7b2ff7 0%, #9d4edd 55%, #5a189a 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Cartão claro em lilás suave */
+.card-light {
+  background: var(--card-light);
+  color: var(--card-light-text);
+  border: 1px solid var(--card-light-border);
+}
+
+/* Títulos grandes no estilo t-display da referência: Geist, peso 600,
+   tamanho fluido, entrelinha 1.05 e tracking fechado. */
+.t-display {
+  font-family: var(--font-display);
+  font-weight: 600;
+  font-size: clamp(2.75rem, 1.6rem + 4.6vw, 4.5rem);
+  line-height: 1.05;
+  letter-spacing: -0.03em;
+}
+
+/* Segunda metade dos títulos: gradiente roxo vibrante sobre o escuro. */
+.font-accent-word {
+  font-family: var(--font-sans);
+  font-style: normal;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  background: var(--gradient-purple);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Destaque com o mesmo gradiente roxo vibrante (texto) */
+.gradient-purple-text {
+  background: var(--gradient-purple);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Botões e cartões com fundo em gradiente roxo vibrante */
+.gradient-purple-bg {
+  background: var(--gradient-purple-strong);
+}
+
+/* Botão principal em pílula: gradiente roxo com brilho violeta. */
+.btn-glow {
+  background: var(--gradient-purple-strong);
+  box-shadow:
+    0 0 0 1px rgba(224, 170, 255, 0.55),
+    0 0 22px rgba(157, 78, 221, 0.5),
+    0 0 46px rgba(123, 47, 247, 0.35),
+    0 14px 34px -8px rgba(46, 10, 92, 0.7);
+}
+
+/* Brilho violeta ao redor dos cartões */
+.card-glow {
+  box-shadow:
+    0 0 0 1px rgba(157, 78, 221, 0.38),
+    0 0 24px rgba(139, 47, 247, 0.28),
+    0 0 54px rgba(90, 24, 154, 0.14),
+    0 20px 44px -20px rgba(0, 0, 0, 0.65);
+}
+.section-light .card-glow,
+.card-glow-light {
+  box-shadow:
+    0 0 0 1px rgba(123, 47, 247, 0.3),
+    0 0 22px rgba(157, 78, 221, 0.22),
+    0 18px 38px -18px rgba(46, 10, 92, 0.35);
+}
+
+/* Selo em pílula pequena no topo de cada seção, com ícone violeta */
+.pill-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  border-radius: 999px;
+  border: 1px solid rgba(157, 78, 221, 0.45);
+  background: rgba(123, 47, 247, 0.14);
+  box-shadow:
+    0 0 0 1px rgba(90, 24, 154, 0.12),
+    0 0 16px rgba(139, 47, 247, 0.28);
+  padding: 0.35rem 0.85rem;
+  font-size: 12.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text);
+}
+.pill-badge .pill-icon {
+  display: inline-flex;
+  color: #c77dff;
+  filter: drop-shadow(0 0 6px rgba(157, 78, 221, 0.9));
+}
+.section-light .pill-badge {
+  background: #ffffff;
+  border-color: rgba(123, 47, 247, 0.4);
+  color: #4c1d95;
+}
+.section-light .pill-badge .pill-icon {
+  color: #7b2ff7;
+}
+
+/* Numerais grandes (passos / ranking / método): sans pesada em violeta */
+.font-step-num {
+  font-family: var(--font-sans);
+  font-style: normal;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: var(--accent-2);
+}
+
+/* Fileiras em movimento (marquee) */
+.marquee {
+  overflow: hidden;
+  white-space: nowrap;
+}
+.marquee-track {
+  display: inline-flex;
+  width: max-content;
+  animation: marquee-scroll 36s linear infinite;
+}
+.marquee-track.reverse {
+  animation-direction: reverse;
+}
+@keyframes marquee-scroll {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .marquee-track {
+    animation: none;
+  }
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+/* ---------- avatar do pinguim: flutua e balança ---------- */
+.penguin-float {
+  animation: penguin-float 5s ease-in-out infinite;
+  will-change: transform;
+}
+.penguin-sway {
+  animation: penguin-sway 7s ease-in-out infinite;
+  transform-origin: 50% 92%;
+  will-change: transform;
+}
+@keyframes penguin-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-14px);
+  }
+}
+@keyframes penguin-sway {
+  0%,
+  100% {
+    transform: rotate(-1.4deg) translateX(-3px);
+  }
+  50% {
+    transform: rotate(1.4deg) translateX(3px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .penguin-float,
+  .penguin-sway {
+    animation: none;
+  }
+}
