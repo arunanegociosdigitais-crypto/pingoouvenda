@@ -19,8 +19,6 @@ import pinguimBracos from "./assets/pinguim-bracos.jpg";
 import pinguimJoinha from "./assets/pinguim-joinha.jpg";
 
 type Sale = ApiResponse<typeof api, "listSales">["sales"][number];
-type Product = ApiResponse<typeof api, "listProducts">["products"][number];
-type Member = ApiResponse<typeof api, "listMembers">["members"][number];
 
 // ---------- conta: período grátis de 7 dias ----------
 
@@ -48,41 +46,6 @@ function formatDateTimeBR(ms: number): string {
   return `${dd}/${mm}/${d.getFullYear()}`;
 }
 
-/** Som de aviso (sino curto) quando cai um cadastro novo no ADM. */
-function playPing() {
-  try {
-    const AC =
-      window.AudioContext ??
-      (window as unknown as { webkitAudioContext?: typeof AudioContext })
-        .webkitAudioContext;
-    if (!AC) return;
-    const ctx = new AC();
-    const notes: [number, number][] = [
-      [880, 0],
-      [1318, 0.16],
-    ];
-    for (const [freq, offset] of notes) {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = "sine";
-      osc.frequency.value = freq;
-      gain.gain.setValueAtTime(0.0001, ctx.currentTime + offset);
-      gain.gain.exponentialRampToValueAtTime(
-        0.22,
-        ctx.currentTime + offset + 0.02,
-      );
-      gain.gain.exponentialRampToValueAtTime(
-        0.0001,
-        ctx.currentTime + offset + 0.45,
-      );
-      osc.connect(gain).connect(ctx.destination);
-      osc.start(ctx.currentTime + offset);
-      osc.stop(ctx.currentTime + offset + 0.5);
-    }
-  } catch {
-    // Sem áudio disponível: a notificação visual continua valendo.
-  }
-}
 type Profile = ApiResponse<typeof api, "getProfile">["profile"];
 
 // ---------- constantes: a estratégia Pingou Venda ----------
@@ -463,12 +426,15 @@ function scrollToId(id: string) {
     ?.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-function goSistema() {
-  scrollToId("sistema");
-}
-
 function goConta() {
-  scrollToId("conta");
+  // Criar conta / dados da conta vivem na PÁGINA DE ACESSO (#/auth) — a
+  // página pública não tem formulário de cadastro embutido. Quem pede a
+  // conta (ex.: o botão "Editar conta" do painel) abre a página de
+  // acesso por este evento, que o App escuta e transforma em
+  // openAuth("conta").
+  window.dispatchEvent(
+    new CustomEvent("pingcou:open-auth", { detail: "conta" }),
+  );
 }
 
 // ---------- ícones (SVG inline) ----------
@@ -592,48 +558,458 @@ function PenguinMascot({ eager = false }: { eager?: boolean }) {
 }
 
 // ---------- entrar com e-mail e senha: login da conta ----------
+//
+// A sessão (e-mail + token) fica SALVA neste aparelho (localStorage):
+// quem já entrou não digita a senha de novo ao reabrir o app — o token é
+// revalidado com o servidor (checkSession) e o painel abre direto, já no
+// nicho da conta. "Sair" apaga a sessão salva.
 
 const LOGIN_SESSION_KEY = "pingcou:login-session";
 
+// ---------- entrar / criar conta com Google (OAuth) ----------
+//
+// Usa o Google Identity Services (conta Google de verdade, com a janela
+// oficial do Google). O Client ID é do projeto Google da Pingou Venda e
+// fica guardado no app (ADM > Login com Google). Sem Client ID salvo, o
+// botão explica o que falta em vez de fingir um login.
+
+type GoogleIdentity = { email: string; name: string; sub: string };
+
+type GoogleIdApi = {
+  accounts: {
+    id: {
+      initialize: (cfg: {
+        client_id: string;
+        callback: (r: { credential?: string }) => void;
+      }) => void;
+      prompt: () => void;
+    };
+  };
+};
+
+function googleApi(): GoogleIdApi | undefined {
+  return (window as unknown as { google?: GoogleIdApi }).google;
+}
+
+let gisLoad: Promise<void> | null = null;
+function loadGoogleScript(): Promise<void> {
+  if (googleApi()) return Promise.resolve();
+  if (!gisLoad) {
+    gisLoad = new Promise<void>((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "https://accounts.google.com/gsi/client";
+      s.async = true;
+      s.onload = () => resolve();
+      s.onerror = () => reject(new Error("gis"));
+      document.head.appendChild(s);
+    });
+  }
+  return gisLoad;
+}
+
+/** Lê e-mail, nome e sub do ID token (JWT) devolvido pelo Google. */
+function decodeGoogleCredential(credential: string): GoogleIdentity | null {
+  try {
+    const part = credential.split(".")[1];
+    if (!part) return null;
+    const base64 = part.replace(/-/g, "+").replace(/_/g, "/");
+    const json = decodeURIComponent(
+      atob(base64)
+        .split("")
+        .map((c) => `%${c.charCodeAt(0).toString(16).padStart(2, "0")}`)
+        .join(""),
+    );
+    const payload = JSON.parse(json) as {
+      email?: string;
+      name?: string;
+      sub?: string;
+    };
+    if (!payload.email || !payload.sub) return null;
+    return {
+      email: payload.email.toLowerCase(),
+      name: payload.name ?? "",
+      sub: payload.sub,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function GoogleAuthButton({
+  mode,
+  businessName = "",
+  niche = "",
+  nicheCustom = "",
+  validate,
+  onDone,
+  variant,
+}: {
+  mode: "login" | "create";
+  businessName?: string;
+  niche?: string;
+  nicheCustom?: string;
+  validate?: () => string | null;
+  onDone: (email: string, token: string) => void;
+  /** "auth": botão escuro da página de acesso, com o rótulo "Google". */
+  variant?: "auth";
+}) {
+  const queryClient = useQueryClient();
+  const configQuery = useQuery({
+    queryKey: ["google-config"],
+    queryFn: () => api.googleConfig({}),
+  });
+  const clientId = configQuery.data?.clientId ?? "";
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const auth = useMutation({
+    mutationFn: api.authWithGoogle,
+    onSuccess: (data, variables) => {
+      setBusy(false);
+      if (data.sessionToken && data.profile) {
+        queryClient.invalidateQueries({ queryKey: ["profile"] });
+        queryClient.invalidateQueries({ queryKey: ["session"] });
+        onDone(variables.email, data.sessionToken);
+      } else {
+        setError(
+          "Não encontrei nenhuma conta com esse Google. Crie sua conta em “Criar conta com Google”.",
+        );
+      }
+    },
+    onError: () => {
+      setBusy(false);
+      setError("Não consegui entrar com o Google agora. Tente de novo.");
+    },
+  });
+
+  async function handleClick() {
+    setError("");
+    const problem = validate?.();
+    if (problem) {
+      setError(problem);
+      return;
+    }
+    if (!clientId) {
+      setError(
+        "O login com Google ainda não foi ativado neste app. Enquanto isso, entre com e-mail e senha.",
+      );
+      return;
+    }
+    setBusy(true);
+    try {
+      await loadGoogleScript();
+      const google = googleApi();
+      if (!google) throw new Error("gis");
+      google.accounts.id.initialize({
+        client_id: clientId,
+        callback: (res) => {
+          const credential = res.credential ?? "";
+          const identity = credential
+            ? decodeGoogleCredential(credential)
+            : null;
+          if (!identity) {
+            setBusy(false);
+            setError("O Google não confirmou sua conta. Tente de novo.");
+            return;
+          }
+          auth.mutate({
+            idToken: credential,
+            email: identity.email,
+            name: identity.name,
+            sub: identity.sub,
+            mode,
+            businessName,
+            niche,
+            nicheCustom,
+          });
+        },
+      });
+      google.accounts.id.prompt();
+      // A janela do Google é assíncrona; se a pessoa fechar sem escolher,
+      // o busy é liberado pelo callback/erro — e por este respiro:
+      window.setTimeout(() => setBusy(false), 4000);
+    } catch {
+      setBusy(false);
+      setError("Não consegui abrir o Google agora. Tente de novo.");
+    }
+  }
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={handleClick}
+        disabled={busy || auth.isPending}
+        aria-label={
+          mode === "login" ? "Entrar com Google" : "Criar conta com Google"
+        }
+        className={
+          variant === "auth"
+            ? "flex w-full items-center justify-center gap-3 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--surface)] px-4 py-3.5 text-base font-semibold text-[var(--text)] disabled:opacity-60"
+            : "flex w-full items-center justify-center gap-3 rounded-full border border-[var(--border)] bg-white px-4 py-3 text-base font-semibold text-[#1f1f1f] disabled:opacity-60"
+        }
+      >
+        <svg viewBox="0 0 24 24" className="h-5 w-5" aria-hidden="true">
+          <path
+            fill="#4285F4"
+            d="M23.5 12.3c0-.9-.1-1.5-.3-2.2H12v4.3h6.5c-.1 1.1-.8 2.7-2.4 3.8l3.7 2.9c2.3-2.1 3.7-5.2 3.7-8.8z"
+          />
+          <path
+            fill="#34A853"
+            d="M12 24c3.2 0 5.9-1.1 7.9-2.9l-3.7-2.9c-1 .7-2.4 1.2-4.2 1.2-3.2 0-5.9-2.1-6.8-5l-3.9 3C3.3 21.3 7.3 24 12 24z"
+          />
+          <path
+            fill="#FBBC05"
+            d="M5.2 14.4c-.2-.7-.4-1.5-.4-2.4s.1-1.7.4-2.4l-3.9-3C.5 8.2 0 10 0 12s.5 3.8 1.3 5.4l3.9-3z"
+          />
+          <path
+            fill="#EA4335"
+            d="M12 4.7c1.8 0 3 .8 3.7 1.4l3.3-3.2C17.9 1.1 15.2 0 12 0 7.3 0 3.3 2.7 1.3 6.6l3.9 3c.9-2.8 3.6-4.9 6.8-4.9z"
+          />
+        </svg>
+        {busy || auth.isPending
+          ? "Abrindo o Google…"
+          : variant === "auth"
+            ? "Google"
+            : mode === "login"
+              ? "Entrar com Google"
+              : "Criar conta com Google"}
+      </button>
+      {error && (
+        <p role="alert" className="mt-2 text-sm text-[var(--danger)]">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Conta Google já confirmada, aguardando os dados da empresa (passo 2). */
+type GooglePending = GoogleIdentity & { idToken: string };
+
+function GoogleLogoSvg() {
+  return (
+    <svg viewBox="0 0 24 24" className="h-5 w-5" aria-hidden="true">
+      <path
+        fill="#4285F4"
+        d="M23.5 12.3c0-.9-.1-1.5-.3-2.2H12v4.3h6.5c-.1 1.1-.8 2.7-2.4 3.8l3.7 2.9c2.3-2.1 3.7-5.2 3.7-8.8z"
+      />
+      <path
+        fill="#34A853"
+        d="M12 24c3.2 0 5.9-1.1 7.9-2.9l-3.7-2.9c-1 .7-2.4 1.2-4.2 1.2-3.2 0-5.9-2.1-6.8-5l-3.9 3C3.3 21.3 7.3 24 12 24z"
+      />
+      <path
+        fill="#FBBC05"
+        d="M5.2 14.4c-.2-.7-.4-1.5-.4-2.4s.1-1.7.4-2.4l-3.9-3C.5 8.2 0 10 0 12s.5 3.8 1.3 5.4l3.9-3z"
+      />
+      <path
+        fill="#EA4335"
+        d="M12 4.7c1.8 0 3 .8 3.7 1.4l3.3-3.2C17.9 1.1 15.2 0 12 0 7.3 0 3.3 2.7 1.3 6.6l3.9 3c.9-2.8 3.6-4.9 6.8-4.9z"
+      />
+    </svg>
+  );
+}
+
+// ---------- criar conta com Google: PASSO 1 é o login Google ----------
+//
+// NENHUM dado da empresa é pedido antes: o botão vem primeiro, sozinho.
+// Ao clicar, abre a janela oficial do Google. Só DEPOIS de a conta Google
+// ser confirmada é que o app pede nome da empresa, nicho etc. (passo 2,
+// no OnboardingCard). Se esse Google já tiver conta, entra direto.
+
+function GoogleSignupStartButton({
+  onExisting,
+  onNeedsProfile,
+}: {
+  onExisting: (email: string, token: string) => void;
+  onNeedsProfile: (pending: GooglePending) => void;
+}) {
+  const queryClient = useQueryClient();
+  const configQuery = useQuery({
+    queryKey: ["google-config"],
+    queryFn: () => api.googleConfig({}),
+  });
+  const clientId = configQuery.data?.clientId ?? "";
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const pendingRef = useRef<GooglePending | null>(null);
+
+  const probe = useMutation({
+    mutationFn: api.authWithGoogle,
+    onSuccess: (data, variables) => {
+      setBusy(false);
+      if (data.sessionToken && data.profile) {
+        // Esse Google já tem conta: entra direto, sem passo 2.
+        queryClient.invalidateQueries({ queryKey: ["profile"] });
+        queryClient.invalidateQueries({ queryKey: ["session"] });
+        onExisting(variables.email, data.sessionToken);
+        return;
+      }
+      // Conta nova: o Google foi confirmado — agora sim o app pede os
+      // dados da empresa (passo 2).
+      const pending = pendingRef.current;
+      if (pending) {
+        onNeedsProfile(pending);
+      } else {
+        setError("O Google não confirmou sua conta. Tente de novo.");
+      }
+    },
+    onError: () => {
+      setBusy(false);
+      setError("Não consegui entrar com o Google agora. Tente de novo.");
+    },
+  });
+
+  async function handleClick() {
+    setError("");
+    if (!clientId) {
+      setError(
+        "O login com Google ainda não foi ativado neste app. Enquanto isso, crie sua conta com e-mail e senha abaixo.",
+      );
+      return;
+    }
+    setBusy(true);
+    try {
+      await loadGoogleScript();
+      const google = googleApi();
+      if (!google) throw new Error("gis");
+      google.accounts.id.initialize({
+        client_id: clientId,
+        callback: (res) => {
+          const credential = res.credential ?? "";
+          const identity = credential
+            ? decodeGoogleCredential(credential)
+            : null;
+          if (!identity) {
+            setBusy(false);
+            setError("O Google não confirmou sua conta. Tente de novo.");
+            return;
+          }
+          pendingRef.current = { ...identity, idToken: credential };
+          // Confere no servidor se esse Google já tem conta (mode login
+          // NÃO cria nada: só entra quem já existe).
+          probe.mutate({
+            idToken: credential,
+            email: identity.email,
+            name: identity.name,
+            sub: identity.sub,
+            mode: "login",
+            businessName: "",
+            niche: "",
+            nicheCustom: "",
+          });
+        },
+      });
+      google.accounts.id.prompt();
+      window.setTimeout(() => setBusy(false), 4000);
+    } catch {
+      setBusy(false);
+      setError("Não consegui abrir o Google agora. Tente de novo.");
+    }
+  }
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={handleClick}
+        disabled={busy || probe.isPending}
+        aria-label="Criar conta com Google"
+        className="flex w-full items-center justify-center gap-3 rounded-full border border-[var(--border)] bg-white px-4 py-3 text-base font-semibold text-[#1f1f1f] disabled:opacity-60"
+      >
+        <GoogleLogoSvg />
+        {busy || probe.isPending
+          ? "Abrindo o Google…"
+          : "Criar conta com Google"}
+      </button>
+      {error && (
+        <p role="alert" className="mt-2 text-sm text-[var(--danger)]">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
 type LoginSession = { email: string; token: string };
 
-function LoginCard({
-  session,
+// ---------- página de acesso (#/auth): entrar, na lógica do VendaMax ----------
+//
+// Página dedicada e limpa, separada da página pública: logo no topo,
+// "Bem-vindo de volta!", e-mail e senha (com olhinho), "Lembrar acesso",
+// "Esqueceu sua senha?", botão grande Entrar, separador "ou continue
+// com", botão Google, link para o cadastro e o link "Conhecer o Pingou
+// Venda →" de volta para a página pública/demonstração. Tema roxo da
+// Pingou Venda — nada de verde.
+
+function IconMail() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="h-5 w-5"
+      aria-hidden="true"
+    >
+      <rect x="3" y="5" width="18" height="14" rx="2.5" />
+      <path d="M3.5 7l8.5 6 8.5-6" />
+    </svg>
+  );
+}
+
+function IconLock() {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="h-5 w-5"
+      aria-hidden="true"
+    >
+      <rect x="4.5" y="10.5" width="15" height="9.5" rx="2.5" />
+      <path d="M8 10.5V8a4 4 0 0 1 8 0v2.5" />
+    </svg>
+  );
+}
+
+function IconEye({ off = false }: { off?: boolean }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="h-5 w-5"
+      aria-hidden="true"
+    >
+      <path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z" />
+      <circle cx="12" cy="12" r="3" />
+      {off && <path d="M4 4l16 16" />}
+    </svg>
+  );
+}
+
+function AuthLoginForm({
   onLogin,
-  onLogout,
-  idPrefix = "",
-  onGoPanel,
 }: {
-  session: LoginSession | null;
-  onLogin: (email: string, token: string) => void;
-  onLogout: () => void;
-  idPrefix?: string;
-  onGoPanel?: () => void;
+  onLogin: (email: string, token: string, remember: boolean) => void;
 }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [remember, setRemember] = useState(true);
+  const [showForgot, setShowForgot] = useState(false);
   const [error, setError] = useState("");
   const [notFound, setNotFound] = useState(false);
   const [wrongPassword, setWrongPassword] = useState(false);
-
-  // Sessão salva neste aparelho: confere de novo com o servidor se o
-  // token ainda vale para a conta (sem pedir a senha outra vez).
-  const sessionQuery = useQuery({
-    queryKey: ["session", session?.email, session?.token],
-    queryFn: () =>
-      api.checkSession({
-        email: session?.email ?? "",
-        sessionToken: session?.token ?? "",
-      }),
-    enabled: Boolean(session),
-  });
-  const sessionProfile = sessionQuery.data?.profile ?? null;
-
-  useEffect(() => {
-    if (session && sessionQuery.data && !sessionQuery.data.profile) {
-      onLogout();
-    }
-  }, [session, sessionQuery.data, onLogout]);
 
   const login = useMutation({
     mutationFn: api.loginWithEmail,
@@ -642,7 +1018,7 @@ function LoginCard({
         setError("");
         setNotFound(false);
         setWrongPassword(false);
-        onLogin(variables.email, data.sessionToken);
+        onLogin(variables.email, data.sessionToken, remember);
       } else if (data.found) {
         setWrongPassword(true);
       } else {
@@ -670,138 +1046,271 @@ function LoginCard({
   }
 
   const inputCls =
-    "w-full rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--surface)] px-3 py-2.5 text-base text-[var(--text)] outline-none focus:border-[var(--accent)]";
-  const labelCls = "mb-1 block text-sm font-medium text-[var(--text)]";
+    "w-full rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--surface)] py-3.5 pl-11 pr-4 text-base text-[var(--text)] outline-none focus:border-[var(--accent)]";
+  const labelCls = "mb-1.5 block text-base font-semibold text-[var(--text)]";
 
-  if (session && sessionQuery.isPending) {
-    return (
-      <div className="card-glow rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5 sm:p-6">
-        <p className="text-sm text-[var(--dim)]">
-          Verificando seu acesso com {session.email}…
-        </p>
-      </div>
-    );
-  }
-
-  if (session && sessionProfile) {
-    const trial = trialInfo(sessionProfile);
-    return (
-      <div className="card-glow rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5 sm:p-6">
-        <div className="flex flex-wrap items-center gap-3">
-          {sessionProfile.logoUrl && (
-            <img
-              src={sessionProfile.logoUrl}
-              alt="Logo da sua empresa"
-              className="h-12 w-12 rounded-[var(--radius-sm)] border border-[var(--border)] bg-white object-contain p-0.5"
+  return (
+    <div>
+      <form onSubmit={handleSubmit}>
+        <div>
+          <label htmlFor="auth-email" className={labelCls}>
+            E-mail
+          </label>
+          <div className="relative">
+            <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--dim)]">
+              <IconMail />
+            </span>
+            <input
+              id="auth-email"
+              className={inputCls}
+              type="email"
+              value={email}
+              onChange={(e) => setEmail(e.target.value)}
+              placeholder="seu@email.com"
+              autoComplete="email"
             />
-          )}
-          <div className="min-w-0">
-            <h3 className="text-2xl font-extrabold tracking-tight text-[var(--text)]">
-              Você entrou!
-              {sessionProfile.businessName
-                ? ` ${sessionProfile.businessName}`
-                : ""}
-            </h3>
-            <p className="mt-0.5 truncate text-sm text-[var(--dim)]">
-              {sessionProfile.email} · Nicho:{" "}
-              {nicheLabelOf(sessionProfile.niche, sessionProfile.nicheCustom)}
-            </p>
           </div>
         </div>
-        {trial.hasTrial && (
-          <p className="mt-3 text-sm text-[var(--dim)]">
-            {trial.expired
-              ? "Seu período grátis de 7 dias acabou. Fale com a Pingou Venda para reativar sua conta."
-              : `Período grátis até ${formatDateTimeBR(sessionProfile.trialEndsAt)} — ${trial.daysLeft} ${trial.daysLeft === 1 ? "dia restante" : "dias restantes"}.`}
-          </p>
-        )}
-        <div className="mt-5 flex flex-wrap gap-3">
+        <div className="mt-5">
+          <label htmlFor="auth-password" className={labelCls}>
+            Senha
+          </label>
+          <div className="relative">
+            <span className="pointer-events-none absolute left-3.5 top-1/2 -translate-y-1/2 text-[var(--dim)]">
+              <IconLock />
+            </span>
+            <input
+              id="auth-password"
+              className={`${inputCls} pr-12`}
+              type={showPassword ? "text" : "password"}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder="Sua senha"
+              autoComplete="current-password"
+            />
+            <button
+              type="button"
+              onClick={() => setShowPassword((v) => !v)}
+              aria-label={showPassword ? "Ocultar senha" : "Mostrar senha"}
+              aria-pressed={showPassword}
+              className="absolute right-2 top-1/2 flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-full text-[var(--dim)]"
+            >
+              <IconEye off={showPassword} />
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-3">
+          <label
+            htmlFor="auth-remember"
+            className="flex cursor-pointer items-center gap-2.5 text-sm font-medium text-[var(--text)]"
+          >
+            <input
+              id="auth-remember"
+              type="checkbox"
+              checked={remember}
+              onChange={(e) => setRemember(e.target.checked)}
+              className="h-5 w-5 shrink-0"
+              style={{ accentColor: "var(--accent)" }}
+            />
+            Lembrar acesso
+          </label>
           <button
             type="button"
-            onClick={() => (onGoPanel ? onGoPanel() : goSistema())}
-            className="btn-glow rounded-full bg-[var(--accent)] px-6 py-3 text-base font-semibold text-[var(--accent-ink)]"
+            onClick={() => setShowForgot((v) => !v)}
+            aria-expanded={showForgot}
+            className="text-sm font-semibold text-[var(--accent-2)]"
+          >
+            Esqueceu sua senha?
+          </button>
+        </div>
+        {showForgot && (
+          <p role="status" className="mt-3 text-sm leading-relaxed text-[var(--dim)]">
+            Esqueceu a senha? Chama a Pingou Venda no Instagram{" "}
+            <a
+              href="https://www.instagram.com/pingoouvenda/"
+              target="_blank"
+              rel="noreferrer"
+              className="font-semibold text-[var(--accent-2)] underline"
+            >
+              @pingoouvenda
+            </a>{" "}
+            que a gente confirma seus dados e te ajuda a voltar para a sua
+            conta.
+          </p>
+        )}
+
+        {error && (
+          <p role="alert" className="mt-4 text-sm text-[var(--danger)]">
+            {error}
+          </p>
+        )}
+        {notFound && (
+          <p role="alert" className="mt-4 text-sm text-[var(--danger)]">
+            Não encontrei nenhuma conta com esse e-mail. Confira o e-mail
+            digitado ou cadastre-se abaixo.
+          </p>
+        )}
+        {wrongPassword && (
+          <p role="alert" className="mt-4 text-sm text-[var(--danger)]">
+            Senha incorreta para esse e-mail. Confira a senha digitada e
+            tente de novo.
+          </p>
+        )}
+
+        <button
+          type="submit"
+          disabled={login.isPending}
+          className="btn-glow mt-6 w-full rounded-[var(--radius-sm)] bg-[var(--accent)] px-4 py-4 text-lg font-bold text-[var(--accent-ink)] disabled:opacity-60"
+        >
+          {login.isPending ? "Entrando…" : "Entrar"}
+        </button>
+      </form>
+
+      <div className="my-6 flex items-center gap-3" aria-hidden="true">
+        <span className="h-px flex-1 bg-[var(--border)]" />
+        <span className="text-sm text-[var(--dim)]">ou continue com</span>
+        <span className="h-px flex-1 bg-[var(--border)]" />
+      </div>
+      <GoogleAuthButton
+        mode="login"
+        variant="auth"
+        onDone={(googleEmail, token) => onLogin(googleEmail, token, remember)}
+      />
+    </div>
+  );
+}
+
+/**
+ * A página de acesso em si (#/auth): entrar ou criar conta, sem TopNav,
+ * sem demonstração e sem painel — só o acesso. Entrar com sucesso (ou
+ * criar a conta) leva direto para a página do painel.
+ */
+function AuthPage({
+  mode,
+  onModeChange,
+  profile,
+  onLogin,
+  onAccountCreated,
+  onLogout,
+  onGoPanel,
+  onGoHome,
+}: {
+  mode: AuthMode;
+  onModeChange: (mode: AuthMode) => void;
+  profile: Profile;
+  onLogin: (email: string, token: string, remember: boolean) => void;
+  onAccountCreated: (
+    email: string,
+    token: string | null,
+    wasCreation: boolean,
+  ) => void;
+  onLogout: () => void;
+  onGoPanel: () => void;
+  onGoHome: () => void;
+}) {
+  const trial = profile ? trialInfo(profile) : null;
+  return (
+    <main className="mx-auto w-full max-w-md px-4 pb-16 pt-12 sm:pt-16">
+      <div className="text-center">
+        <img
+          src={logoPingcou}
+          alt="Pingou Venda"
+          className="mx-auto w-[210px] max-w-[70vw]"
+        />
+      </div>
+
+      {profile ? (
+        <div className="mt-10">
+          <h1 className="text-3xl font-extrabold tracking-tight text-[var(--text)]">
+            Você entrou!
+            {profile.businessName ? ` ${profile.businessName}` : ""}
+          </h1>
+          <p className="mt-2 text-base text-[var(--dim)]">
+            {profile.email} · Nicho:{" "}
+            {nicheLabelOf(profile.niche, profile.nicheCustom)}
+          </p>
+          {trial?.hasTrial && (
+            <p className="mt-2 text-sm text-[var(--dim)]">
+              {trial.expired
+                ? "Seu período grátis de 7 dias acabou. Fale com a Pingou Venda para reativar sua conta."
+                : `Período grátis até ${formatDateTimeBR(profile.trialEndsAt)} — ${trial.daysLeft} ${trial.daysLeft === 1 ? "dia restante" : "dias restantes"}.`}
+            </p>
+          )}
+          <button
+            type="button"
+            onClick={onGoPanel}
+            className="btn-glow mt-6 w-full rounded-[var(--radius-sm)] bg-[var(--accent)] px-4 py-4 text-lg font-bold text-[var(--accent-ink)]"
           >
             Ir para o meu painel
           </button>
           <button
             type="button"
             onClick={onLogout}
-            className="rounded-full border border-[var(--border)] px-6 py-3 text-base font-semibold text-[var(--text)]"
+            className="mt-3 w-full rounded-[var(--radius-sm)] border border-[var(--border)] px-4 py-3.5 text-base font-semibold text-[var(--text)]"
           >
             Sair
           </button>
         </div>
-      </div>
-    );
-  }
+      ) : mode === "entrar" ? (
+        <div className="mt-10">
+          <h1 className="text-4xl font-extrabold tracking-tight text-[var(--text)]">
+            Bem-vindo de volta!
+          </h1>
+          <p className="mt-2 text-base text-[var(--dim)]">
+            Faça login para continuar
+          </p>
+          <div className="mt-8">
+            <AuthLoginForm onLogin={onLogin} />
+          </div>
+          <p className="mt-8 text-center text-base text-[var(--dim)]">
+            Ainda não tem uma conta?{" "}
+            <button
+              type="button"
+              onClick={() => onModeChange("conta")}
+              className="font-bold text-[var(--accent-2)]"
+            >
+              Cadastre-se
+            </button>
+          </p>
+        </div>
+      ) : (
+        <div className="mt-10">
+          <h1 className="text-4xl font-extrabold tracking-tight text-[var(--text)]">
+            Crie sua conta
+          </h1>
+          <p className="mt-2 text-base text-[var(--dim)]">
+            Comece agora com 7 dias grátis — o painel já abre no seu nicho.
+          </p>
+          <div className="mt-8">
+            <OnboardingCard idPrefix="auth-" onAccountSaved={onAccountCreated} />
+          </div>
+          <p className="mt-8 text-center text-base text-[var(--dim)]">
+            Já tem uma conta?{" "}
+            <button
+              type="button"
+              onClick={() => onModeChange("entrar")}
+              className="font-bold text-[var(--accent-2)]"
+            >
+              Entrar
+            </button>
+          </p>
+        </div>
+      )}
 
-  return (
-    <form
-      onSubmit={handleSubmit}
-      className="card-glow rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5 sm:p-6"
-    >
-      <h3 className="text-2xl font-extrabold tracking-tight text-[var(--text)]">
-        Entrar com e-mail e senha
-      </h3>
-      <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">
-        Já criou sua conta? Digite o e-mail cadastrado — Gmail ou qualquer
-        outro e-mail — e a sua senha para entrar e ir direto ao seu painel.
-      </p>
-      <div className="mt-5">
-        <label htmlFor={`${idPrefix}login-email`} className={labelCls}>
-          E-mail da sua conta
-        </label>
-        <input
-          id={`${idPrefix}login-email`}
-          className={inputCls}
-          type="email"
-          value={email}
-          onChange={(e) => setEmail(e.target.value)}
-          placeholder="voce@gmail.com"
-          autoComplete="email"
-        />
+      <div className="mt-10 text-center">
+        <button
+          type="button"
+          onClick={onGoHome}
+          className="text-base font-semibold text-[var(--accent-2)]"
+        >
+          Conhecer o Pingou Venda →
+        </button>
       </div>
-      <div className="mt-4">
-        <label htmlFor={`${idPrefix}login-password`} className={labelCls}>
-          Senha da sua conta
-        </label>
-        <input
-          id={`${idPrefix}login-password`}
-          className={inputCls}
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          placeholder="Sua senha"
-          autoComplete="current-password"
-        />
-      </div>
-      {error && (
-        <p role="alert" className="mt-3 text-sm text-[var(--danger)]">
-          {error}
-        </p>
-      )}
-      {notFound && (
-        <p role="alert" className="mt-3 text-sm text-[var(--danger)]">
-          Não encontrei nenhuma conta com esse e-mail. Confira o e-mail
-          digitado ou crie sua conta em “Criar conta”.
-        </p>
-      )}
-      {wrongPassword && (
-        <p role="alert" className="mt-3 text-sm text-[var(--danger)]">
-          Senha incorreta para esse e-mail. Confira a senha digitada e tente
-          de novo.
-        </p>
-      )}
-      <button
-        type="submit"
-        disabled={login.isPending}
-        className="btn-glow mt-5 w-full rounded-full bg-[var(--accent)] px-4 py-3 text-base font-semibold text-[var(--accent-ink)] disabled:opacity-60"
-      >
-        {login.isPending ? "Entrando…" : "Entrar na minha conta"}
-      </button>
-    </form>
+    </main>
   );
 }
+
 
 // ---------- criação de conta: o nicho aparece já no cadastro ----------
 
@@ -809,7 +1318,11 @@ function OnboardingCard({
   onAccountSaved,
   idPrefix = "",
 }: {
-  onAccountSaved?: (email: string, token: string | null) => void;
+  onAccountSaved?: (
+    email: string,
+    token: string | null,
+    wasCreation: boolean,
+  ) => void;
   idPrefix?: string;
 }) {
   const queryClient = useQueryClient();
@@ -828,6 +1341,61 @@ function OnboardingCard({
   const [savedMsg, setSavedMsg] = useState("");
   const hydrated = useRef(false);
   const creatingRef = useRef(false);
+
+  // Criar conta com Google em DOIS passos: 1º o login Google (botão no
+  // topo, sem pedir nada antes); 2º, com o Google já confirmado, este
+  // estado guarda a identidade e o formulário pede os dados da empresa.
+  const [googlePending, setGooglePending] = useState<GooglePending | null>(
+    null,
+  );
+  const [googleError, setGoogleError] = useState("");
+
+  const completeGoogle = useMutation({
+    mutationFn: api.authWithGoogle,
+    onSuccess: (data, variables) => {
+      if (data.sessionToken && data.profile) {
+        queryClient.invalidateQueries({ queryKey: ["profile"] });
+        queryClient.invalidateQueries({ queryKey: ["session"] });
+        setGoogleError("");
+        setGooglePending(null);
+        onAccountSaved?.(variables.email, data.sessionToken, true);
+      } else {
+        setGoogleError(
+          "Não consegui concluir o cadastro com o Google. Tente de novo.",
+        );
+      }
+    },
+    onError: () =>
+      setGoogleError("Não consegui concluir o cadastro. Tente de novo."),
+  });
+
+  function handleGoogleComplete(e: FormEvent) {
+    e.preventDefault();
+    if (!googlePending) return;
+    if (!businessName.trim()) {
+      setGoogleError("Informe o nome da empresa para concluir o cadastro.");
+      return;
+    }
+    if (!niche) {
+      setGoogleError("Escolha o nicho do seu negócio para concluir.");
+      return;
+    }
+    if (niche === "outro" && !nicheCustom.trim()) {
+      setGoogleError("Escreva o seu nicho no campo de “Outro”.");
+      return;
+    }
+    setGoogleError("");
+    completeGoogle.mutate({
+      idToken: googlePending.idToken,
+      email: googlePending.email,
+      name: googlePending.name,
+      sub: googlePending.sub,
+      mode: "create",
+      businessName: businessName.trim(),
+      niche,
+      nicheCustom: niche === "outro" ? nicheCustom.trim() : "",
+    });
+  }
 
   // Preenche o formulário com a conta salva — uma vez, sem apagar o que
   // a pessoa estiver digitando depois.
@@ -893,10 +1461,14 @@ function OnboardingCard({
       queryClient.invalidateQueries({ queryKey: ["profile"] });
       setError("");
       const savedEmail = email.trim().toLowerCase();
-      if (savedEmail) onAccountSaved?.(savedEmail, data.sessionToken);
+      // Criar a conta já entra automaticamente: o token de sessão volta
+      // junto do salvamento e a sessão é aberta na hora, sem precisar
+      // fazer login depois. Quem chamou decide a navegação (painel).
+      if (savedEmail)
+        onAccountSaved?.(savedEmail, data.sessionToken, creatingRef.current);
       setSavedMsg(
         creatingRef.current
-          ? "Conta criada! Você ganhou 7 dias grátis — o painel já está no seu nicho."
+          ? "Conta criada! Você já entrou automaticamente — bem-vinda ao seu painel. Você ganhou 7 dias grátis e o painel já está no seu nicho."
           : "Conta salva! Seu nicho já aparece no painel e nas suas próximas vendas.",
       );
     },
@@ -950,6 +1522,105 @@ function OnboardingCard({
     "w-full rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--surface)] px-3 py-2.5 text-base text-[var(--text)] outline-none focus:border-[var(--accent)]";
   const labelCls = "mb-1 block text-sm font-medium text-[var(--text)]";
 
+  // PASSO 2 do cadastro com Google: o login Google já foi feito — só
+  // agora o app pede os dados da empresa (nome, nicho). Sem e-mail/senha:
+  // a conta é a do Google confirmado no passo 1.
+  if (googlePending && !profile) {
+    return (
+      <form
+        onSubmit={handleGoogleComplete}
+        className="card-glow rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5 sm:p-6"
+      >
+        <h3 className="text-2xl font-extrabold tracking-tight text-[var(--text)]">
+          Google conectado! Agora, os dados da sua empresa
+        </h3>
+        <p className="mt-2 text-sm leading-relaxed text-[var(--dim)]">
+          Você entrou com <strong>{googlePending.email}</strong>. Para
+          terminar de criar sua conta, informe o nome da empresa e o nicho —
+          o painel já abre no seu nicho e você entra automaticamente.
+        </p>
+        <div className="mt-5">
+          <label htmlFor={`${idPrefix}g-name`} className={labelCls}>
+            Nome da empresa *
+          </label>
+          <input
+            id={`${idPrefix}g-name`}
+            className={inputCls}
+            value={businessName}
+            onChange={(e) => setBusinessName(e.target.value)}
+            placeholder="Ex.: Loja da Dé, Imports da Maria…"
+            autoComplete="off"
+          />
+        </div>
+        <div className="mt-5">
+          <span className={labelCls} id={`${idPrefix}g-niche-label`}>
+            Qual é o seu nicho? *
+          </span>
+          <div
+            className="grid grid-cols-2 gap-2 sm:grid-cols-3"
+            role="group"
+            aria-labelledby={`${idPrefix}g-niche-label`}
+          >
+            {NICHES.map((n) => (
+              <button
+                key={n.key}
+                type="button"
+                aria-pressed={niche === n.key}
+                onClick={() => setNiche(n.key)}
+                className={`rounded-full border px-3 py-2.5 text-sm font-semibold ${
+                  niche === n.key
+                    ? "btn-glow border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]"
+                    : "border-[var(--border)] bg-[var(--surface-alt)] text-[var(--text)]"
+                }`}
+              >
+                {n.label}
+              </button>
+            ))}
+          </div>
+          {niche === "outro" && (
+            <div className="mt-3">
+              <label htmlFor={`${idPrefix}g-niche-custom`} className={labelCls}>
+                Escreva o seu nicho *
+              </label>
+              <input
+                id={`${idPrefix}g-niche-custom`}
+                className={inputCls}
+                value={nicheCustom}
+                onChange={(e) => setNicheCustom(e.target.value)}
+                placeholder="Ex.: Marcenaria, Fotografia, Aulas…"
+                autoComplete="off"
+              />
+            </div>
+          )}
+        </div>
+        {googleError && (
+          <p role="alert" className="mt-3 text-sm text-[var(--danger)]">
+            {googleError}
+          </p>
+        )}
+        <button
+          type="submit"
+          disabled={completeGoogle.isPending}
+          className="btn-glow mt-5 w-full rounded-full bg-[var(--accent)] px-4 py-3 text-base font-semibold text-[var(--accent-ink)] disabled:opacity-60"
+        >
+          {completeGoogle.isPending
+            ? "Criando sua conta…"
+            : "Concluir cadastro e entrar no painel"}
+        </button>
+        <button
+          type="button"
+          onClick={() => {
+            setGooglePending(null);
+            setGoogleError("");
+          }}
+          className="mt-3 w-full text-center text-sm text-[var(--dim)] underline"
+        >
+          Voltar e usar outro jeito de criar a conta
+        </button>
+      </form>
+    );
+  }
+
   return (
     <form
       onSubmit={handleSubmit}
@@ -977,6 +1648,45 @@ function OnboardingCard({
           ? "É aqui que você troca o nicho ou o nome do negócio. A mudança vale para o painel e para as próximas vendas."
           : "Nome da empresa e nicho escolhidos agora: o painel já abre organizado para o que você vende — Gestão para as vendas locais, Marketplace para o seu nicho."}
       </p>
+
+      {!profile && (
+        <div className="mt-5 rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--surface-alt)] p-4">
+          <p className="text-base font-bold text-[var(--text)]">
+            Passo 1: criar conta com Google
+          </p>
+          <p className="mt-1 text-sm leading-relaxed text-[var(--dim)]">
+            Primeiro você faz o login com sua conta Google — sem preencher
+            nada antes. Só depois do Google confirmado é que o app pede o
+            nome da empresa e o nicho.
+          </p>
+          <div className="mt-3">
+            <GoogleSignupStartButton
+              onExisting={(googleEmail, token) =>
+                onAccountSaved?.(googleEmail, token, true)
+              }
+              onNeedsProfile={(pending) => {
+                setGooglePending(pending);
+                setGoogleError("");
+                if (!businessName.trim() && pending.name)
+                  setBusinessName(pending.name);
+              }}
+            />
+          </div>
+          <div
+            className="my-4 flex items-center gap-3"
+            aria-hidden="true"
+          >
+            <span className="h-px flex-1 bg-[var(--border)]" />
+            <span className="text-xs font-semibold uppercase tracking-wide text-[var(--dim)]">
+              ou crie com e-mail e senha
+            </span>
+            <span className="h-px flex-1 bg-[var(--border)]" />
+          </div>
+          <p className="text-sm font-semibold text-[var(--text)]">
+            Preencha os dados abaixo somente se for criar com e-mail e senha:
+          </p>
+        </div>
+      )}
 
       <div className="mt-5">
         <label htmlFor={`${idPrefix}acc-name`} className={labelCls}>
@@ -1085,7 +1795,7 @@ function OnboardingCard({
         <p className="mt-1 text-xs text-[var(--dim)]">
           {profile
             ? "Preencha só se quiser trocar a senha. Deixando vazio, a senha atual continua valendo."
-            : "É com esse e-mail e essa senha que você entra na sua conta depois."}
+            : "Ao criar a conta, você já entra automaticamente — sem precisar fazer login depois — e vai direto para o seu painel."}
         </p>
       </div>
 
@@ -1160,111 +1870,13 @@ function OnboardingCard({
   );
 }
 
-// ---------- entrar / criar conta: janela NA MESMA página ----------
+// ---------- entrar / criar conta: PÁGINA de acesso (#/auth) ----------
 //
-// Os botões "Entrar" e "Criar conta" abrem esta janela por cima da página
-// atual — nada de nova aba, nova janela ou sair do site. Fechar (no X, fora
-// da janela ou com Esc) volta exatamente para onde a pessoa estava.
+// Os botões "Entrar" e "Criar conta" abrem a página de autenticação —
+// página dedicada e limpa (AuthPage), separada da página pública e do
+// painel. Entrar ou criar a conta leva direto para a página do painel.
 
 type AuthMode = "entrar" | "conta";
-
-function AuthModal({
-  mode,
-  onModeChange,
-  onClose,
-  session,
-  onLogin,
-  onLogout,
-}: {
-  mode: AuthMode;
-  onModeChange: (mode: AuthMode) => void;
-  onClose: () => void;
-  session: LoginSession | null;
-  onLogin: (email: string, token: string | null) => void;
-  onLogout: () => void;
-}) {
-  const boxRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "Escape") onClose();
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  // Ao abrir (ou trocar entre Entrar/Criar conta), o foco vai direto para o
-  // primeiro campo do formulário, já na tela atual.
-  useEffect(() => {
-    const id = window.setTimeout(() => {
-      boxRef.current
-        ?.querySelector<HTMLInputElement>("input:not([type='file'])")
-        ?.focus();
-    }, 60);
-    return () => window.clearTimeout(id);
-  }, [mode]);
-
-  return (
-    <div
-      className="fixed inset-0 z-[70] overflow-y-auto bg-black/70 px-3 pb-10 pt-24 sm:pt-28"
-      role="dialog"
-      aria-modal="true"
-      aria-label={mode === "entrar" ? "Entrar na sua conta" : "Criar sua conta"}
-      onClick={(e) => {
-        if (e.target === e.currentTarget) onClose();
-      }}
-    >
-      <div ref={boxRef} className="relative mx-auto w-full max-w-3xl">
-        <button
-          type="button"
-          onClick={onClose}
-          aria-label="Fechar"
-          className="absolute -top-3 right-3 z-10 flex h-10 w-10 items-center justify-center rounded-full border border-[var(--border)] bg-[var(--surface)] text-lg font-bold text-[var(--text)] shadow-lg"
-        >
-          ×
-        </button>
-        {mode === "entrar" ? (
-          <>
-            <LoginCard
-              idPrefix="modal-"
-              session={session}
-              onLogin={onLogin}
-              onLogout={onLogout}
-              onGoPanel={() => {
-                onClose();
-                window.setTimeout(() => goSistema(), 60);
-              }}
-            />
-            <p className="mt-4 text-center text-sm text-[var(--dim)]">
-              Ainda não tem conta?{" "}
-              <button
-                type="button"
-                onClick={() => onModeChange("conta")}
-                className="font-bold text-[var(--accent-2)] underline"
-              >
-                Criar conta
-              </button>
-            </p>
-          </>
-        ) : (
-          <>
-            <OnboardingCard idPrefix="modal-" onAccountSaved={onLogin} />
-            <p className="mt-4 text-center text-sm text-[var(--dim)]">
-              Já tem conta?{" "}
-              <button
-                type="button"
-                onClick={() => onModeChange("entrar")}
-                className="font-bold text-[var(--accent-2)] underline"
-              >
-                Entrar
-              </button>
-            </p>
-          </>
-        )}
-      </div>
-    </div>
-  );
-}
 
 // ---------- páginas internas dos nichos: seleção, estoque e venda ----------
 
@@ -1280,11 +1892,26 @@ function chipCls(active: boolean): string {
   }`;
 }
 
-/** Hub dos nichos: um cartão por nicho, com o resumo do estoque. */
-function NicheHub({ onOpen }: { onOpen: (key: string) => void }) {
+/**
+ * Hub dos nichos: um cartão por nicho.
+ * SEM login, é só demonstração: mostra as categorias e sugestões de cada
+ * nicho (dados fixos do catálogo) e o botão leva para entrar/criar conta —
+ * nenhum estoque real é lido. COM login, mostra o resumo do estoque de
+ * verdade e abre a página funcional do nicho.
+ */
+function NicheHub({
+  onOpen,
+  loggedIn,
+  onAuth,
+}: {
+  onOpen: (key: string) => void;
+  loggedIn: boolean;
+  onAuth: (mode: AuthMode) => void;
+}) {
   const productsQuery = useQuery({
     queryKey: ["products"],
     queryFn: () => api.listProducts({}),
+    enabled: loggedIn,
   });
   const products = productsQuery.data?.products ?? [];
   return (
@@ -1307,17 +1934,30 @@ function NicheHub({ onOpen }: { onOpen: (key: string) => void }) {
               {n.desc}
             </p>
             <p className="mt-4 text-xs font-medium uppercase tracking-wide text-[var(--dim)]">
-              {productsQuery.isPending
-                ? "Carregando estoque…"
-                : `${mine.length} ${mine.length === 1 ? "produto" : "produtos"} · ${units} un. em estoque`}
+              {loggedIn
+                ? productsQuery.isPending
+                  ? "Carregando estoque…"
+                  : `${mine.length} ${mine.length === 1 ? "produto" : "produtos"} · ${units} un. em estoque`
+                : `${n.categories.length} categorias · ${n.starters.length} sugestões para montar o estoque`}
             </p>
-            <button
-              type="button"
-              onClick={() => onOpen(n.key)}
-              className="btn-glow mt-4 w-full rounded-full bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-[var(--accent-ink)]"
-            >
-              Abrir página de {n.label}
-            </button>
+            {loggedIn ? (
+              <button
+                type="button"
+                onClick={() => onOpen(n.key)}
+                className="btn-glow mt-4 w-full rounded-full bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-[var(--accent-ink)]"
+              >
+                Abrir página de {n.label}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => onAuth("conta")}
+                aria-label={`Entrar para abrir a página de ${n.label}`}
+                className="btn-glow mt-4 w-full rounded-full bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-[var(--accent-ink)]"
+              >
+                Entrar para abrir meu nicho
+              </button>
+            )}
           </article>
         );
       })}
@@ -1988,836 +2628,6 @@ function NichePage({
   );
 }
 
-// ---------- aba Revenda: acesso por e-mail, só o liberado ----------
-
-type ResellerSession = {
-  member: Member;
-  catalog: Product[];
-};
-
-function RevendaView() {
-  const [email, setEmail] = useState("");
-  const [session, setSession] = useState<ResellerSession | null>(null);
-  const [error, setError] = useState("");
-  const [regName, setRegName] = useState("");
-  const [regEmail, setRegEmail] = useState("");
-  const [regMsg, setRegMsg] = useState("");
-  const [regError, setRegError] = useState("");
-  const [justRegisteredEmail, setJustRegisteredEmail] = useState("");
-
-  const access = useMutation({
-    mutationFn: api.resellerAccess,
-    onSuccess: (res) => {
-      if (!res.member) {
-        setError(
-          "Este e-mail ainda não está cadastrado como revenda. Cadastre-se abaixo ou peça para a Pingou Venda liberar seu acesso.",
-        );
-        return;
-      }
-      setError("");
-      setSession({ member: res.member, catalog: res.catalog });
-    },
-    onError: () =>
-      setError("Não consegui verificar o e-mail. Tente de novo."),
-  });
-
-  const register = useMutation({
-    mutationFn: api.addMember,
-    onSuccess: (_res, variables) => {
-      setRegError("");
-      setJustRegisteredEmail(variables.email);
-      setEmail(variables.email);
-      setRegMsg(
-        "Cadastro pronto! A Pingou Venda foi avisada. Toque abaixo para entrar no seu painel agora mesmo.",
-      );
-      setRegName("");
-      setRegEmail("");
-    },
-    onError: (e) =>
-      setRegError(
-        e instanceof Error ? e.message : "Não consegui cadastrar. Tente de novo.",
-      ),
-  });
-
-  function handleEnter(e: FormEvent) {
-    e.preventDefault();
-    if (!EMAIL_RE.test(email.trim())) {
-      setError("Digite um e-mail válido para entrar.");
-      return;
-    }
-    access.mutate({ email: email.trim().toLowerCase() });
-  }
-
-  function handleRegister(e: FormEvent) {
-    e.preventDefault();
-    if (!regName.trim()) {
-      setRegError("Escreva seu nome para cadastrar.");
-      return;
-    }
-    if (!EMAIL_RE.test(regEmail.trim())) {
-      setRegError("Digite um e-mail válido para cadastrar.");
-      return;
-    }
-    setRegMsg("");
-    register.mutate({
-      name: regName.trim(),
-      email: regEmail.trim().toLowerCase(),
-      role: "revendedor",
-    });
-  }
-
-  if (session) {
-    return (
-      <div>
-        <div className="card-glow flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-4 py-3">
-          <p className="text-sm text-[var(--text)]">
-            <span className="font-bold">Painel de revenda</span> ·{" "}
-            {session.member.name} ({session.member.email})
-          </p>
-          <div className="flex gap-2">
-            <button
-              type="button"
-              disabled={access.isPending}
-              onClick={() =>
-                access.mutate({ email: session.member.email })
-              }
-              className="rounded-full border border-[var(--border)] bg-[var(--surface-alt)] px-3 py-1.5 text-sm font-semibold text-[var(--text)] disabled:opacity-60"
-            >
-              {access.isPending ? "Atualizando…" : "Atualizar catálogo"}
-            </button>
-            <button
-              type="button"
-              onClick={() => setSession(null)}
-              className="rounded-full border border-[var(--border)] bg-[var(--surface-alt)] px-3 py-1.5 text-sm font-semibold text-[var(--text)]"
-            >
-              Sair
-            </button>
-          </div>
-        </div>
-        <p className="mt-4 text-sm text-[var(--dim)]">
-          Você está vendo <strong>só o que foi liberado para revenda</strong>{" "}
-          — {session.catalog.length}{" "}
-          {session.catalog.length === 1 ? "produto" : "produtos"} com preço e
-          estoque. Nada além disso aparece neste painel.
-        </p>
-        {session.catalog.length === 0 ? (
-          <p className="card-glow mt-4 rounded-[var(--radius)] border border-dashed border-[var(--border)] bg-[var(--surface)] p-6 text-center text-sm text-[var(--dim)]">
-            Nada liberado para revenda ainda. Quando a Pingou Venda liberar
-            produtos do estoque, eles aparecem aqui.
-          </p>
-        ) : (
-          <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-3">
-            {session.catalog.map((p) => (
-              <article
-                key={p.id}
-                className="card-glow rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--surface)] p-3"
-              >
-                <p className="text-xs font-bold uppercase tracking-wide text-[var(--accent-2)]">
-                  {nichePageOf(p.niche)?.label ?? p.niche}
-                </p>
-                <p className="mt-1 truncate text-sm font-bold text-[var(--text)]">
-                  {p.name}
-                </p>
-                <p className="mt-0.5 text-xs text-[var(--dim)]">
-                  {[p.category, p.variant].filter(Boolean).join(" · ")}
-                </p>
-                <p className="mt-1.5 text-base font-extrabold text-[var(--text)]">
-                  {formatBRL(p.priceCents)}
-                </p>
-                <p
-                  className={`mt-0.5 text-xs font-semibold ${
-                    p.stock <= 0 ? "text-[var(--danger)]" : "text-[var(--dim)]"
-                  }`}
-                >
-                  {p.stock <= 0 ? "Esgotado" : `${p.stock} em estoque`}
-                </p>
-              </article>
-            ))}
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  return (
-    <div className="grid gap-4 lg:grid-cols-2">
-      <form
-        onSubmit={handleEnter}
-        className="card-glow rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5"
-      >
-        <h3 className="text-xl font-extrabold tracking-tight text-[var(--text)]">
-          Já sou revenda
-        </h3>
-        <p className="mt-1 text-sm text-[var(--dim)]">
-          Entre com o e-mail cadastrado para abrir seu painel — só com o que
-          está liberado para revenda.
-        </p>
-        <div className="mt-4">
-          <label htmlFor="rev-email" className={STOCK_LABEL}>
-            E-mail de acesso
-          </label>
-          <input
-            id="rev-email"
-            className={STOCK_INPUT}
-            type="email"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            placeholder="voce@email.com"
-            autoComplete="email"
-          />
-        </div>
-        {error && (
-          <p role="alert" className="mt-3 text-sm text-[var(--danger)]">
-            {error}
-          </p>
-        )}
-        <button
-          type="submit"
-          disabled={access.isPending}
-          className="btn-glow mt-4 w-full rounded-full bg-[var(--accent)] px-4 py-3 text-base font-semibold text-[var(--accent-ink)] disabled:opacity-60"
-        >
-          {access.isPending ? "Verificando…" : "Entrar no painel de revenda"}
-        </button>
-      </form>
-
-      <form
-        onSubmit={handleRegister}
-        className="card-glow rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5"
-      >
-        <h3 className="text-xl font-extrabold tracking-tight text-[var(--text)]">
-          Quero ser revenda
-        </h3>
-        <p className="mt-1 text-sm text-[var(--dim)]">
-          Cadastre seu nome e e-mail: a Pingou Venda recebe o aviso na hora,
-          com notificação e som no ADM.
-        </p>
-        <div className="mt-4">
-          <label htmlFor="rev-reg-name" className={STOCK_LABEL}>
-            Seu nome
-          </label>
-          <input
-            id="rev-reg-name"
-            className={STOCK_INPUT}
-            value={regName}
-            onChange={(e) => setRegName(e.target.value)}
-            placeholder="Ex.: Ana Souza"
-            autoComplete="name"
-          />
-        </div>
-        <div className="mt-3">
-          <label htmlFor="rev-reg-email" className={STOCK_LABEL}>
-            Seu e-mail
-          </label>
-          <input
-            id="rev-reg-email"
-            className={STOCK_INPUT}
-            type="email"
-            value={regEmail}
-            onChange={(e) => setRegEmail(e.target.value)}
-            placeholder="voce@email.com"
-            autoComplete="email"
-          />
-        </div>
-        {regError && (
-          <p role="alert" className="mt-3 text-sm text-[var(--danger)]">
-            {regError}
-          </p>
-        )}
-        {regMsg && (
-          <p role="status" className="mt-3 text-sm font-medium text-[var(--accent-2)]">
-            {regMsg}
-          </p>
-        )}
-        {justRegisteredEmail && (
-          <button
-            type="button"
-            disabled={access.isPending}
-            onClick={() => access.mutate({ email: justRegisteredEmail })}
-            className="btn-glow mt-3 w-full rounded-full bg-[var(--accent)] px-4 py-3 text-base font-semibold text-[var(--accent-ink)] disabled:opacity-60"
-          >
-            {access.isPending
-              ? "Abrindo seu painel…"
-              : "Entrar agora no meu painel de revenda"}
-          </button>
-        )}
-        <button
-          type="submit"
-          disabled={register.isPending}
-          className="btn-glow mt-4 w-full rounded-full bg-[var(--accent)] px-4 py-3 text-base font-semibold text-[var(--accent-ink)] disabled:opacity-60"
-        >
-          {register.isPending ? "Enviando…" : "Cadastrar para revenda"}
-        </button>
-      </form>
-    </div>
-  );
-}
-
-// ---------- ADM da dona: código, e-mails, pessoas, notificações ----------
-
-function AdminPanel() {
-  const queryClient = useQueryClient();
-  const profileQuery = useQuery({
-    queryKey: ["profile"],
-    queryFn: () => api.getProfile({}),
-  });
-  const profile: Profile = profileQuery.data?.profile ?? null;
-  const trial = trialInfo(profile);
-
-  const notificationsQuery = useQuery({
-    queryKey: ["notifications"],
-    queryFn: () => api.listNotifications({}),
-    refetchInterval: 8000,
-  });
-  const notifications = notificationsQuery.data?.notifications ?? [];
-  const unread = notifications.filter((n) => !n.isRead).length;
-  const prevUnread = useRef<number | null>(null);
-  useEffect(() => {
-    if (prevUnread.current !== null && unread > prevUnread.current) {
-      playPing();
-    }
-    prevUnread.current = unread;
-  }, [unread]);
-
-  const markRead = useMutation({
-    mutationFn: api.markNotificationsRead,
-    onSuccess: () =>
-      queryClient.invalidateQueries({ queryKey: ["notifications"] }),
-  });
-
-  const [accountEmail, setAccountEmail] = useState("");
-  const emailHydrated = useRef(false);
-  useEffect(() => {
-    if (emailHydrated.current || profileQuery.isPending) return;
-    emailHydrated.current = true;
-    if (profile) setAccountEmail(profile.email);
-  }, [profileQuery.isPending, profile]);
-
-  const [adminMsg, setAdminMsg] = useState("");
-  const [adminError, setAdminError] = useState("");
-  const saveEmail = useMutation({
-    mutationFn: api.updateAccountEmail,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["profile"] });
-      setAdminError("");
-      setAdminMsg("E-mail da conta atualizado.");
-    },
-    onError: (e) =>
-      setAdminError(e instanceof Error ? e.message : "Não consegui salvar."),
-  });
-
-  const [extendDays, setExtendDays] = useState("7");
-  const extendTrial = useMutation({
-    mutationFn: api.extendTrial,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["profile"] });
-      setAdminError("");
-      setAdminMsg("Período grátis estendido.");
-    },
-    onError: () => setAdminError("Não consegui estender o período."),
-  });
-
-  const membersQuery = useQuery({
-    queryKey: ["members"],
-    queryFn: () => api.listMembers({}),
-  });
-  const members = membersQuery.data?.members ?? [];
-  const [newName, setNewName] = useState("");
-  const [newEmail, setNewEmail] = useState("");
-  const [newRole, setNewRole] = useState<"revendedor" | "vendedor">("vendedor");
-  const [memberMsg, setMemberMsg] = useState("");
-  const [memberError, setMemberError] = useState("");
-  const [emailEdits, setEmailEdits] = useState<Record<number, string>>({});
-  const [confirmingId, setConfirmingId] = useState<number | null>(null);
-
-  const addMember = useMutation({
-    mutationFn: api.addMember,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["members"] });
-      queryClient.invalidateQueries({ queryKey: ["notifications"] });
-      setMemberError("");
-      setMemberMsg("Pessoa cadastrada! A notificação já caiu aqui no ADM.");
-      setNewName("");
-      setNewEmail("");
-    },
-    onError: (e) =>
-      setMemberError(
-        e instanceof Error ? e.message : "Não consegui cadastrar.",
-      ),
-  });
-
-  const updateMember = useMutation({
-    mutationFn: api.updateMember,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["members"] });
-      setMemberError("");
-      setMemberMsg("Dados atualizados.");
-    },
-    onError: (e) =>
-      setMemberError(
-        e instanceof Error ? e.message : "Não consegui atualizar.",
-      ),
-  });
-
-  const deleteMember = useMutation({
-    mutationFn: api.deleteMember,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["members"] });
-      setConfirmingId(null);
-    },
-  });
-
-  function handleAddMember(e: FormEvent) {
-    e.preventDefault();
-    if (!newName.trim()) {
-      setMemberError("Escreva o nome da pessoa.");
-      return;
-    }
-    if (!EMAIL_RE.test(newEmail.trim())) {
-      setMemberError("Digite um e-mail válido.");
-      return;
-    }
-    setMemberMsg("");
-    addMember.mutate({
-      name: newName.trim(),
-      email: newEmail.trim().toLowerCase(),
-      role: newRole,
-    });
-  }
-
-  return (
-    <div className="space-y-4">
-      {/* Notificações */}
-      <section className="card-glow rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <h3 className="text-xl font-extrabold tracking-tight text-[var(--text)]">
-            Notificações
-            {unread > 0 && (
-              <span className="ml-2 rounded-full bg-[var(--danger)] px-2.5 py-0.5 text-xs font-bold text-white">
-                {unread} {unread === 1 ? "nova" : "novas"}
-              </span>
-            )}
-          </h3>
-          {unread > 0 && (
-            <button
-              type="button"
-              disabled={markRead.isPending}
-              onClick={() => markRead.mutate({})}
-              className="rounded-full border border-[var(--border)] bg-[var(--surface-alt)] px-3 py-1.5 text-sm font-semibold text-[var(--text)]"
-            >
-              Marcar como lidas
-            </button>
-          )}
-        </div>
-        {notifications.length === 0 ? (
-          <p className="mt-3 text-sm text-[var(--dim)]">
-            Nenhum aviso ainda. Quando alguém se cadastrar para revenda ou
-            como vendedor, cai aqui — com som, se esta tela estiver aberta.
-          </p>
-        ) : (
-          <ul className="mt-3 space-y-2">
-            {notifications.slice(0, 10).map((n) => (
-              <li
-                key={n.id}
-                className={`rounded-[var(--radius-sm)] border px-3 py-2 text-sm ${
-                  n.isRead
-                    ? "border-[var(--border)] text-[var(--dim)]"
-                    : "border-[var(--accent-2)] text-[var(--text)]"
-                }`}
-              >
-                {n.message}{" "}
-                <span className="text-xs text-[var(--dim)]">
-                  · {formatDateTimeBR(n.createdAt)}
-                </span>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-
-      {/* Conta da loja */}
-      <section className="card-glow rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5">
-        <h3 className="text-xl font-extrabold tracking-tight text-[var(--text)]">
-          Conta da loja
-        </h3>
-        <p className="mt-1 text-sm text-[var(--dim)]">
-          {profile
-            ? `${profile.businessName || "Seu negócio"} · Nicho: ${nicheLabelOf(profile.niche, profile.nicheCustom)}`
-            : "Nenhuma conta criada ainda."}
-          {trial.hasTrial &&
-            (trial.expired
-              ? " · Período grátis encerrado."
-              : ` · Grátis até ${formatDateTimeBR(profile?.trialEndsAt ?? 0)} (${trial.daysLeft} dias).`)}
-        </p>
-        <div className="mt-4 grid gap-3 sm:grid-cols-[1fr_auto] sm:items-end">
-          <div>
-            <label htmlFor="adm-email" className={STOCK_LABEL}>
-              E-mail da conta
-            </label>
-            <input
-              id="adm-email"
-              className={STOCK_INPUT}
-              type="email"
-              value={accountEmail}
-              onChange={(e) => setAccountEmail(e.target.value)}
-              placeholder="voce@sualoja.com.br"
-              autoComplete="email"
-            />
-          </div>
-          <button
-            type="button"
-            disabled={saveEmail.isPending}
-            onClick={() => {
-              if (!EMAIL_RE.test(accountEmail.trim())) {
-                setAdminError("Digite um e-mail válido para a conta.");
-                return;
-              }
-              setAdminMsg("");
-              saveEmail.mutate({ email: accountEmail.trim().toLowerCase() });
-            }}
-            className="btn-glow rounded-full bg-[var(--accent)] px-5 py-3 text-sm font-semibold text-[var(--accent-ink)] disabled:opacity-60"
-          >
-            Salvar e-mail
-          </button>
-        </div>
-        <div className="mt-4 flex flex-wrap items-end gap-3">
-          <div>
-            <label htmlFor="adm-extend" className={STOCK_LABEL}>
-              Estender período grátis (dias)
-            </label>
-            <input
-              id="adm-extend"
-              className={`${STOCK_INPUT} w-28`}
-              type="number"
-              inputMode="numeric"
-              min={1}
-              max={365}
-              value={extendDays}
-              onChange={(e) => setExtendDays(e.target.value)}
-            />
-          </div>
-          <button
-            type="button"
-            disabled={extendTrial.isPending}
-            onClick={() => {
-              const d = Number(extendDays);
-              if (!Number.isInteger(d) || d < 1 || d > 365) {
-                setAdminError("Escolha entre 1 e 365 dias para estender.");
-                return;
-              }
-              setAdminMsg("");
-              extendTrial.mutate({ days: d });
-            }}
-            className="rounded-full border border-[var(--border)] bg-[var(--surface-alt)] px-4 py-3 text-sm font-semibold text-[var(--text)] disabled:opacity-60"
-          >
-            Estender período
-          </button>
-        </div>
-        {adminError && (
-          <p role="alert" className="mt-3 text-sm text-[var(--danger)]">
-            {adminError}
-          </p>
-        )}
-        {adminMsg && (
-          <p role="status" className="mt-3 text-sm font-medium text-[var(--accent-2)]">
-            {adminMsg}
-          </p>
-        )}
-      </section>
-
-      {/* Pessoas: vendedores e revendedores */}
-      <section className="card-glow rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5">
-        <h3 className="text-xl font-extrabold tracking-tight text-[var(--text)]">
-          Vendedores e revendedores
-        </h3>
-        <form onSubmit={handleAddMember} className="mt-4 grid gap-3 sm:grid-cols-3">
-          <div>
-            <label htmlFor="adm-m-name" className={STOCK_LABEL}>
-              Nome
-            </label>
-            <input
-              id="adm-m-name"
-              className={STOCK_INPUT}
-              value={newName}
-              onChange={(e) => setNewName(e.target.value)}
-              placeholder="Ex.: Ana Souza"
-              autoComplete="off"
-            />
-          </div>
-          <div>
-            <label htmlFor="adm-m-email" className={STOCK_LABEL}>
-              E-mail
-            </label>
-            <input
-              id="adm-m-email"
-              className={STOCK_INPUT}
-              type="email"
-              value={newEmail}
-              onChange={(e) => setNewEmail(e.target.value)}
-              placeholder="pessoa@email.com"
-              autoComplete="off"
-            />
-          </div>
-          <div>
-            <label htmlFor="adm-m-role" className={STOCK_LABEL}>
-              Função
-            </label>
-            <select
-              id="adm-m-role"
-              className={STOCK_INPUT}
-              value={newRole}
-              onChange={(e) =>
-                setNewRole(e.target.value as "revendedor" | "vendedor")
-              }
-            >
-              <option value="vendedor">Vendedor</option>
-              <option value="revendedor">Revendedor</option>
-            </select>
-          </div>
-          <button
-            type="submit"
-            disabled={addMember.isPending}
-            className="btn-glow rounded-full bg-[var(--accent)] px-4 py-3 text-sm font-semibold text-[var(--accent-ink)] disabled:opacity-60 sm:col-span-3"
-          >
-            {addMember.isPending ? "Cadastrando…" : "Cadastrar pessoa"}
-          </button>
-        </form>
-        {memberError && (
-          <p role="alert" className="mt-3 text-sm text-[var(--danger)]">
-            {memberError}
-          </p>
-        )}
-        {memberMsg && (
-          <p role="status" className="mt-3 text-sm font-medium text-[var(--accent-2)]">
-            {memberMsg}
-          </p>
-        )}
-        {membersQuery.isPending ? (
-          <p className="mt-4 text-sm text-[var(--dim)]">Carregando pessoas…</p>
-        ) : members.length === 0 ? (
-          <p className="mt-4 text-sm text-[var(--dim)]">
-            Ninguém cadastrado ainda. Cadastre seus vendedores acima — e quem
-            se cadastrar pela aba Revenda aparece aqui também.
-          </p>
-        ) : (
-          <ul className="mt-4 divide-y divide-[var(--border)]">
-            {members.map((m) => (
-              <li key={m.id} className="py-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <p className="text-base font-medium text-[var(--text)]">
-                    {m.name}{" "}
-                    <span className="ml-1 rounded-full border border-[var(--accent-2)] px-2 py-0.5 text-xs font-bold uppercase tracking-wide text-[var(--accent-2)]">
-                      {m.role}
-                    </span>
-                    {!m.active && (
-                      <span className="ml-1 text-xs font-semibold text-[var(--danger)]">
-                        desativado
-                      </span>
-                    )}
-                  </p>
-                  <div className="flex gap-2">
-                    <button
-                      type="button"
-                      disabled={updateMember.isPending}
-                      onClick={() =>
-                        updateMember.mutate({ id: m.id, active: !m.active })
-                      }
-                      className="rounded-full border border-[var(--border)] bg-[var(--surface-alt)] px-3 py-1.5 text-sm font-semibold text-[var(--text)]"
-                    >
-                      {m.active ? "Desativar" : "Ativar"}
-                    </button>
-                    {confirmingId === m.id ? (
-                      <>
-                        <button
-                          type="button"
-                          disabled={deleteMember.isPending}
-                          onClick={() => deleteMember.mutate({ id: m.id })}
-                          className="rounded-full px-3 py-1.5 text-sm font-semibold text-[var(--danger)]"
-                        >
-                          Confirmar remoção
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setConfirmingId(null)}
-                          className="rounded-full px-3 py-1.5 text-sm text-[var(--dim)]"
-                        >
-                          Cancelar
-                        </button>
-                      </>
-                    ) : (
-                      <button
-                        type="button"
-                        aria-label={`Remover ${m.name}`}
-                        onClick={() => setConfirmingId(m.id)}
-                        className="rounded-full px-3 py-1.5 text-sm text-[var(--dim)] underline"
-                      >
-                        Remover
-                      </button>
-                    )}
-                  </div>
-                </div>
-                <div className="mt-2 flex flex-wrap items-end gap-2">
-                  <div className="min-w-56 flex-1">
-                    <label htmlFor={`adm-m-edit-${m.id}`} className={STOCK_LABEL}>
-                      E-mail de {m.name}
-                    </label>
-                    <input
-                      id={`adm-m-edit-${m.id}`}
-                      className={STOCK_INPUT}
-                      type="email"
-                      value={emailEdits[m.id] ?? m.email}
-                      onChange={(e) =>
-                        setEmailEdits((cur) => ({
-                          ...cur,
-                          [m.id]: e.target.value,
-                        }))
-                      }
-                      autoComplete="off"
-                    />
-                  </div>
-                  <button
-                    type="button"
-                    disabled={updateMember.isPending}
-                    onClick={() => {
-                      const next = (emailEdits[m.id] ?? m.email)
-                        .trim()
-                        .toLowerCase();
-                      if (!EMAIL_RE.test(next)) {
-                        setMemberError("Digite um e-mail válido para salvar.");
-                        return;
-                      }
-                      setMemberMsg("");
-                      updateMember.mutate({ id: m.id, email: next });
-                    }}
-                    className="rounded-full border border-[var(--border)] bg-[var(--surface-alt)] px-4 py-2.5 text-sm font-semibold text-[var(--text)]"
-                  >
-                    Salvar e-mail
-                  </button>
-                </div>
-              </li>
-            ))}
-          </ul>
-        )}
-      </section>
-    </div>
-  );
-}
-
-function AdminView() {
-  const queryClient = useQueryClient();
-  const statusQuery = useQuery({
-    queryKey: ["admin-status"],
-    queryFn: () => api.adminStatus({}),
-  });
-  const hasCode = statusQuery.data?.hasCode ?? false;
-  const [unlocked, setUnlocked] = useState(false);
-  const [code, setCode] = useState("");
-  const [confirmCode, setConfirmCode] = useState("");
-  const [error, setError] = useState("");
-
-  const createCode = useMutation({
-    mutationFn: api.setAdminCode,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["admin-status"] });
-      setError("");
-      setUnlocked(true);
-    },
-    onError: (e) =>
-      setError(e instanceof Error ? e.message : "Não consegui salvar o código."),
-  });
-
-  const verify = useMutation({
-    mutationFn: api.verifyAdminCode,
-    onSuccess: (res) => {
-      if (res.ok) {
-        setError("");
-        setUnlocked(true);
-      } else {
-        setError("Código incorreto. Tente de novo.");
-      }
-    },
-    onError: () => setError("Não consegui verificar. Tente de novo."),
-  });
-
-  if (statusQuery.isPending) {
-    return <p className="text-sm text-[var(--dim)]">Carregando o ADM…</p>;
-  }
-
-  if (unlocked) return <AdminPanel />;
-
-  return (
-    <form
-      onSubmit={(e) => {
-        e.preventDefault();
-        if (!hasCode) {
-          if (code.trim().length < 4) {
-            setError("O código precisa de pelo menos 4 caracteres.");
-            return;
-          }
-          if (code !== confirmCode) {
-            setError("Os códigos não batem — digite o mesmo código duas vezes.");
-            return;
-          }
-          createCode.mutate({ code: code.trim() });
-        } else {
-          verify.mutate({ code: code.trim() });
-        }
-      }}
-      className="card-glow mx-auto max-w-md rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-5"
-    >
-      <h3 className="text-xl font-extrabold tracking-tight text-[var(--text)]">
-        {hasCode ? "Entrar no ADM" : "Crie seu código do ADM"}
-      </h3>
-      <p className="mt-1 text-sm text-[var(--dim)]">
-        {hasCode
-          ? "Digite o código da dona para abrir o painel de administração."
-          : "Este código é só seu: é com ele que você entra no ADM para alterar e-mails, cadastrar vendedores e ver as notificações."}
-      </p>
-      <div className="mt-4">
-        <label htmlFor="adm-code" className={STOCK_LABEL}>
-          Código do ADM
-        </label>
-        <input
-          id="adm-code"
-          className={STOCK_INPUT}
-          type="password"
-          value={code}
-          onChange={(e) => setCode(e.target.value)}
-          placeholder="••••"
-          autoComplete="off"
-        />
-      </div>
-      {!hasCode && (
-        <div className="mt-3">
-          <label htmlFor="adm-code2" className={STOCK_LABEL}>
-            Repita o código
-          </label>
-          <input
-            id="adm-code2"
-            className={STOCK_INPUT}
-            type="password"
-            value={confirmCode}
-            onChange={(e) => setConfirmCode(e.target.value)}
-            placeholder="••••"
-            autoComplete="off"
-          />
-        </div>
-      )}
-      {error && (
-        <p role="alert" className="mt-3 text-sm text-[var(--danger)]">
-          {error}
-        </p>
-      )}
-      <button
-        type="submit"
-        disabled={createCode.isPending || verify.isPending}
-        className="btn-glow mt-4 w-full rounded-full bg-[var(--accent)] px-4 py-3 text-base font-semibold text-[var(--accent-ink)] disabled:opacity-60"
-      >
-        {hasCode ? "Abrir o ADM" : "Salvar código e abrir o ADM"}
-      </button>
-    </form>
-  );
-}
-
 // ---------- barras por grupo (categoria / nicho / canal) ----------
 
 function GroupBars({ title, groups }: { title: string; groups: GroupTotal[] }) {
@@ -2854,13 +2664,14 @@ function GroupBars({ title, groups }: { title: string; groups: GroupTotal[] }) {
   );
 }
 
-// ---------- página de vendas: controle completo das vendas ----------
+// ---------- página de vendas: SÓ a lista de vendas ----------
 //
-// Não é uma listinha de demonstração: é a página de trabalho das vendas.
-// Busca por produto, filtro por canal, ordenação, resumo rápido do dia,
-// tabela completa (no celular vira cartões), subtotal da página,
-// paginação e exportação em CSV — tudo sobre as vendas reais já
-// filtradas por período, frente e nicho no painel.
+// Tela própria, totalmente separada do painel: aqui NÃO entra nenhuma
+// métrica do dashboard (sem faturamento, sem cartões de resumo, sem
+// gráfico, sem rankings, sem seletor de período do painel). É só a lista
+// de vendas reais — busca por produto, filtro por canal, ordenação,
+// tabela completa (no celular vira cartões), paginação e exportação em
+// CSV — sobre TODAS as vendas, sem recorte do painel.
 
 type SaleSortKey = "recente" | "antiga" | "maior" | "menor";
 
@@ -2923,7 +2734,6 @@ function SaleActions({
 
 function SalesPage({
   sales,
-  hasAnySale,
   confirmingId,
   onAskDelete,
   onCancelDelete,
@@ -2931,7 +2741,6 @@ function SalesPage({
   deleting,
 }: {
   sales: Sale[];
-  hasAnySale: boolean;
   confirmingId: number | null;
   onAskDelete: (id: number) => void;
   onCancelDelete: () => void;
@@ -2951,29 +2760,6 @@ function SalesPage({
     const set = new Set<string>();
     for (const s of sales) if (s.channel) set.add(s.channel);
     return [...set].sort((a, b) => a.localeCompare(b));
-  }, [sales]);
-
-  const summary = useMemo(() => {
-    const today = todayISO();
-    const revenue = sales.reduce((acc, s) => acc + saleTotal(s), 0);
-    const pieces = sales.reduce((acc, s) => acc + s.quantity, 0);
-    const todaySales = sales.filter((s) => s.date === today);
-    const days = new Set(sales.map((s) => s.date));
-    const best = sales.reduce<Sale | null>(
-      (acc, s) => (acc === null || saleTotal(s) > saleTotal(acc) ? s : acc),
-      null,
-    );
-    return {
-      revenue,
-      todayRevenue: todaySales.reduce((acc, s) => acc + saleTotal(s), 0),
-      todayCount: todaySales.length,
-      days: days.size,
-      avgPieces:
-        sales.length > 0
-          ? (pieces / sales.length).toFixed(1).replace(".", ",")
-          : "0",
-      best,
-    };
   }, [sales]);
 
   const filtered = useMemo(() => {
@@ -3011,14 +2797,12 @@ function SalesPage({
     return sorted;
   }, [sales, query, channelFilter, sortKey]);
 
-  const filteredTotal = filtered.reduce((acc, s) => acc + saleTotal(s), 0);
   const totalPages = Math.max(1, Math.ceil(filtered.length / SALES_PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
   const pageRows = filtered.slice(
     (safePage - 1) * SALES_PAGE_SIZE,
     safePage * SALES_PAGE_SIZE,
   );
-  const pageSubtotal = pageRows.reduce((acc, s) => acc + saleTotal(s), 0);
   const filtersActive =
     query.trim() !== "" || channelFilter !== "todos" || sortKey !== "recente";
 
@@ -3071,29 +2855,6 @@ function SalesPage({
     URL.revokeObjectURL(url);
   }
 
-  const miniStats = [
-    {
-      label: "Vendido hoje",
-      value: formatBRL(summary.todayRevenue),
-      sub: `${summary.todayCount} ${summary.todayCount === 1 ? "venda" : "vendas"} hoje`,
-    },
-    {
-      label: "Dias com venda",
-      value: String(summary.days),
-      sub: "no recorte atual",
-    },
-    {
-      label: "Itens por venda",
-      value: summary.avgPieces,
-      sub: "média do recorte",
-    },
-    {
-      label: "Maior venda",
-      value: summary.best ? formatBRL(saleTotal(summary.best)) : "—",
-      sub: summary.best ? summary.best.item : "sem vendas no recorte",
-    },
-  ];
-
   const selectCls =
     "w-full rounded-[var(--radius-sm)] border border-[var(--border)] bg-[var(--surface)] px-3 py-2.5 text-base text-[var(--text)] outline-none focus:border-[var(--accent)]";
   const labelCls = "mb-1 block text-sm font-medium text-[var(--text)]";
@@ -3104,10 +2865,9 @@ function SalesPage({
     </span>
   );
 
-  // Sem nenhuma venda no recorte: nada de tabela, estatísticas ou exemplos —
-  // só a mensagem honesta. Se ainda não existe venda nenhuma no app, é
-  // "ainda não há vendas"; se existe venda fora do recorte, é o recorte
-  // (período/filtros do painel) que está vazio.
+  // Sem nenhuma venda: nada de tabela ou exemplos — só a mensagem
+  // honesta. Esta página mostra TODAS as vendas (sem recorte do painel),
+  // então lista vazia significa que ainda não há venda nenhuma.
   if (sales.length === 0) {
     return (
       <section className="mt-8" aria-label="Página de vendas">
@@ -3116,14 +2876,11 @@ function SalesPage({
         </h3>
         <div className="card-glow mt-4 rounded-[var(--radius)] border border-dashed border-[var(--border)] bg-[var(--surface)] p-6 text-center">
           <p className="text-lg font-extrabold tracking-tight text-[var(--text)]">
-            {hasAnySale
-              ? "Nenhuma venda neste recorte"
-              : "Ainda não há vendas registradas"}
+            Ainda não há vendas registradas
           </p>
           <p className="mx-auto mt-1 max-w-md text-sm text-[var(--dim)]">
-            {hasAnySale
-              ? "Ajuste o período ou os filtros do painel para ver as vendas que já foram registradas no app."
-              : "Quando você registrar uma venda no app, ela aparece aqui — com busca, filtros, ordenação e exportação."}
+            Registre a venda no formulário acima, nesta mesma página, e ela
+            aparece aqui — com busca, filtros, ordenação e exportação.
           </p>
         </div>
       </section>
@@ -3138,9 +2895,8 @@ function SalesPage({
             Página de vendas
           </h3>
           <p className="mt-0.5 text-sm text-[var(--dim)]">
-            Controle completo: busque, filtre, ordene e exporte —{" "}
-            {sales.length} {sales.length === 1 ? "venda" : "vendas"} no
-            recorte, {formatBRL(summary.revenue)} no total.
+            Só a lista: busque, filtre, ordene e exporte — {sales.length}{" "}
+            {sales.length === 1 ? "venda registrada" : "vendas registradas"}.
           </p>
         </div>
         <button
@@ -3153,27 +2909,7 @@ function SalesPage({
         </button>
       </div>
 
-      {/* Resumo rápido da página de vendas */}
-      <div className="mt-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
-        {miniStats.map((m) => (
-          <div
-            key={m.label}
-            className="card-glow rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-3 py-3"
-          >
-            <p className="truncate text-xl font-extrabold tracking-tight text-[var(--text)]">
-              {m.value}
-            </p>
-            <p className="mt-0.5 text-xs font-medium uppercase tracking-wide text-[var(--dim)]">
-              {m.label}
-            </p>
-            <p className="mt-0.5 truncate text-xs text-[var(--dim)]">
-              {m.sub}
-            </p>
-          </div>
-        ))}
-      </div>
-
-      {/* Busca, canal e ordenação */}
+      {/* Busca, canal e ordenação — controles DESTA página (nada do painel) */}
       <div className="card-glow mt-4 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-4">
         <div>
           <label htmlFor="sales-search" className={labelCls}>
@@ -3229,8 +2965,7 @@ function SalesPage({
         <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
           <p className="text-sm text-[var(--dim)]" role="status">
             {filtered.length}{" "}
-            {filtered.length === 1 ? "venda encontrada" : "vendas encontradas"}{" "}
-            · total {formatBRL(filteredTotal)}
+            {filtered.length === 1 ? "venda encontrada" : "vendas encontradas"}
           </p>
           {filtersActive && (
             <button
@@ -3251,7 +2986,7 @@ function SalesPage({
           </p>
           <p className="mt-1 text-sm text-[var(--dim)]">
             Tente outro produto ou limpe a busca e os filtros para ver todas
-            as vendas do recorte.
+            as vendas.
           </p>
           <button
             type="button"
@@ -3394,14 +3129,11 @@ function SalesPage({
             ))}
           </ul>
 
-          {/* Subtotal da página + paginação */}
+          {/* Paginação da lista (sem subtotal: total é métrica do painel) */}
           <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
             <p className="text-sm text-[var(--dim)]">
-              Subtotal desta página:{" "}
-              <span className="font-bold text-[var(--text)]">
-                {formatBRL(pageSubtotal)}
-              </span>{" "}
-              · mostrando {pageRows.length} de {filtered.length}
+              Mostrando {pageRows.length} de {filtered.length}{" "}
+              {filtered.length === 1 ? "venda" : "vendas"}
             </p>
             {totalPages > 1 && (
               <div className="flex items-center gap-2">
@@ -3433,9 +3165,35 @@ function SalesPage({
   );
 }
 
-// ---------- painel de vendas (o sistema) ----------
+// ---------- painel (dashboard) e página de vendas: PÁGINAS separadas ----------
+//
+// O sistema tem PÁGINAS próprias, nunca misturadas na mesma tela:
+// a página "painel" é SÓ o dashboard (faturamento, gráfico, rankings,
+// dados do cliente logado) — ele mostra, nunca vende. A página "vendas"
+// é a página de vendas: é lá que mora o REGISTRAR VENDA (vender por
+// seleção, com baixa automática no estoque), junto da lista de vendas
+// (busca, tabela, CSV). A página inicial é outra página: apresentação e
+// demonstração, sem painel e sem vender. Criar a conta / entrar leva
+// para a PÁGINA DO PAINEL — a página de vendas só abre quando a pessoa
+// navega até ela. Cada página tem endereço próprio (#/painel e
+// #/vendas), então dá para abrir, voltar e compartilhar a página certa.
 
-function Tracker() {
+type SistemaView = "painel" | "vendas";
+type AppPage = "inicio" | "painel" | "vendas" | "auth";
+
+function pageFromHash(): AppPage {
+  const h = window.location.hash.replace(/^#\/?/, "");
+  if (h.startsWith("painel")) return "painel";
+  if (h.startsWith("vendas")) return "vendas";
+  if (h.startsWith("auth") || h.startsWith("entrar")) return "auth";
+  return "inicio";
+}
+
+function hashForPage(page: AppPage): string {
+  return page === "inicio" ? "#/" : `#/${page}`;
+}
+
+function Tracker({ view }: { view: SistemaView }) {
   const queryClient = useQueryClient();
   const [periodKey, setPeriodKey] = useState<PeriodKey>("30d");
   const [customFrom, setCustomFrom] = useState("");
@@ -3443,6 +3201,9 @@ function Tracker() {
   const [segmentFilter, setSegmentFilter] = useState<SegmentFilter>("todos");
   const [nicheFilter, setNicheFilter] = useState<string>("todos");
   const [confirmingId, setConfirmingId] = useState<number | null>(null);
+  // Nicho do REGISTRAR VENDA da página de vendas: começa no nicho da
+  // conta e a pessoa pode trocar ali mesmo, sem sair da página.
+  const [sellNicheKey, setSellNicheKey] = useState<string | null>(null);
 
   const profileQuery = useQuery({
     queryKey: ["profile"],
@@ -3454,6 +3215,13 @@ function Tracker() {
     : "";
   const trial = trialInfo(profile);
 
+  // Nicho efetivo do registrar venda (página de vendas): o escolhido ali,
+  // ou o nicho da conta quando ele tem página própria, ou o primeiro.
+  const sellNiche: NichePageData =
+    (sellNicheKey ? nichePageOf(sellNicheKey) : undefined) ??
+    (profile ? nichePageOf(profile.niche) : undefined) ??
+    (NICHE_PAGES[0] as NichePageData);
+
   const range = useMemo(
     () => periodRange(periodKey, customFrom, customTo),
     [periodKey, customFrom, customTo],
@@ -3464,14 +3232,15 @@ function Tracker() {
     queryFn: () => api.listSales(range),
   });
 
-  // Total de vendas no app, sem recorte: é o que separa "ainda não há
-  // vendas" de "nenhuma venda neste período/filtro" na página de vendas.
+  // Lista COMPLETA de vendas, sem nenhum recorte: é a fonte da página de
+  // vendas (aba própria). O painel usa a consulta com período/filtros
+  // acima; a página de vendas NUNCA usa o recorte do painel.
   const totalSalesQuery = useQuery({
     queryKey: ["sales", "total"],
     queryFn: () => api.listSales({}),
   });
-  const totalSalesCount = totalSalesQuery.data?.sales.length;
-  const hasAnySale = (totalSalesCount ?? 0) > 0;
+  const vendasSales = totalSalesQuery.data?.sales ?? [];
+  const hasAnySale = vendasSales.length > 0;
 
   const deleteSale = useMutation({
     mutationFn: (id: number) => api.deleteSale({ id }),
@@ -3570,8 +3339,8 @@ function Tracker() {
 
   return (
     <div>
-      {/* Faixa da conta: nicho visível no painel */}
-      {profile ? (
+      {/* Faixa da conta: SÓ no painel — nunca na página de vendas */}
+      {view === "painel" && profile ? (
         <div className="card-glow mb-6 flex flex-wrap items-center justify-between gap-3 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-4 py-3">
           <p className="flex items-center gap-3 text-sm text-[var(--text)]">
             {profile.logoUrl && (
@@ -3600,6 +3369,7 @@ function Tracker() {
           </button>
         </div>
       ) : (
+        view === "painel" &&
         !profileQuery.isPending && (
           <div className="card-glow mb-6 rounded-[var(--radius)] border border-dashed border-[var(--accent-2)] bg-[var(--surface)] px-4 py-4 text-center">
             <p className="text-base font-bold text-[var(--text)]">
@@ -3620,8 +3390,8 @@ function Tracker() {
         )
       )}
 
-      {/* Período grátis da conta */}
-      {profile && trial.hasTrial && (
+      {/* Período grátis da conta — SÓ no painel */}
+      {view === "painel" && profile && trial.hasTrial && (
         <div
           className={`card-glow mb-6 rounded-[var(--radius)] border px-4 py-3 ${
             trial.expired
@@ -3652,7 +3422,15 @@ function Tracker() {
         </div>
       )}
 
-      {/* Período */}
+      {/* Sem abas aqui dentro: Painel e Página de vendas são PÁGINAS
+          separadas do app (endereços #/painel e #/vendas). A navegação
+          entre elas fica na barra de páginas de cada página (PageNav),
+          nunca um painel embutido dentro da página de vendas. */}
+
+      {/* Período — SÓ do painel: define o recorte das métricas do
+          dashboard. A página de vendas não tem período: ela lista tudo. */}
+      {view === "painel" && (
+        <>
       <div
         className="flex flex-wrap gap-2"
         role="group"
@@ -3709,7 +3487,13 @@ function Tracker() {
           </div>
         </div>
       )}
+        </>
+      )}
 
+      {/* Dashboard (aba Painel): frentes, faturamento e métricas — só aqui,
+          nunca junto da página de vendas */}
+      {view === "painel" && (
+        <>
       {/* Frentes separadas: Gestão (vendas locais) x Marketplace (nichos) */}
       <section className="pt-8" aria-label="Frentes separadas">
         <h3 className="text-xl font-extrabold tracking-tight text-[var(--text)]">
@@ -3833,9 +3617,12 @@ function Tracker() {
         ))}
       </section>
 
-      {salesQuery.isError && (
+        </>
+      )}
+
+      {view === "painel" && salesQuery.isError && (
         <p role="alert" className="mt-6 text-sm text-[var(--danger)]">
-          Não consegui carregar suas vendas.{" "}
+          Não consegui carregar os números do painel.{" "}
           <button
             type="button"
             className="underline"
@@ -3846,13 +3633,72 @@ function Tracker() {
         </p>
       )}
 
-      {!salesQuery.isPending &&
-        !hasSales &&
-        !salesQuery.isError &&
+      {/* REGISTRAR VENDA — mora SÓ na página de vendas: é aqui que se
+          vende (seleção de produto + baixa automática no estoque). O
+          painel NÃO vende: ele só mostra as métricas. */}
+      {view === "vendas" && (
+        <section className="mt-2" aria-label="Registrar venda">
+          <h3 className="text-xl font-extrabold tracking-tight text-[var(--text)]">
+            Registrar venda
+          </h3>
+          <p className="mt-1 text-sm text-[var(--dim)]">
+            Página de vendas é para vender: escolha o nicho, toque no
+            produto, ajuste a quantidade e confirme — a venda entra na lista
+            abaixo e o estoque baixa sozinho.
+          </p>
+          <div
+            className="mt-3 flex flex-wrap gap-2"
+            role="group"
+            aria-label="Nicho da venda"
+          >
+            {NICHE_PAGES.map((n) => (
+              <button
+                key={n.key}
+                type="button"
+                aria-pressed={sellNiche.key === n.key}
+                onClick={() => setSellNicheKey(n.key)}
+                className={chipCls(sellNiche.key === n.key)}
+              >
+                {n.label}
+                {profile && profile.niche === n.key ? " · seu nicho" : ""}
+              </button>
+            ))}
+          </div>
+          <div className="mt-4">
+            <QuickSale niche={sellNiche} />
+          </div>
+          <div className="mt-4">
+            <StockManager niche={sellNiche} />
+          </div>
+        </section>
+      )}
+
+      {/* Aba Página de vendas: a lista de vendas — sem faixa da conta,
+          sem período, sem métrica nenhuma do painel. A fonte é a lista
+          completa (vendasSales), nunca o recorte do painel. */}
+      {view === "vendas" && totalSalesQuery.isPending && (
+        <p className="mt-6 text-sm text-[var(--dim)]">
+          Carregando suas vendas…
+        </p>
+      )}
+      {view === "vendas" && totalSalesQuery.isError && (
+        <p role="alert" className="mt-6 text-sm text-[var(--danger)]">
+          Não consegui carregar suas vendas.{" "}
+          <button
+            type="button"
+            className="underline"
+            onClick={() => totalSalesQuery.refetch()}
+          >
+            Tentar de novo
+          </button>
+        </p>
+      )}
+      {view === "vendas" &&
+        !totalSalesQuery.isPending &&
+        !totalSalesQuery.isError &&
         totalSalesQuery.data && (
           <SalesPage
-            sales={sales}
-            hasAnySale={hasAnySale}
+            sales={vendasSales}
             confirmingId={confirmingId}
             onAskDelete={(id) => setConfirmingId(id)}
             onCancelDelete={() => setConfirmingId(null)}
@@ -3861,7 +3707,28 @@ function Tracker() {
           />
         )}
 
-      {hasSales && (
+      {/* Aba Painel sem vendas no recorte: aviso SÓ do dashboard — sem
+          lista, sem prévia e sem cartão da página de vendas aqui dentro */}
+      {view === "painel" &&
+        !salesQuery.isPending &&
+        !hasSales &&
+        !salesQuery.isError &&
+        totalSalesQuery.data && (
+          <div className="card-glow mt-6 rounded-[var(--radius)] border border-dashed border-[var(--border)] bg-[var(--surface)] p-6 text-center">
+            <p className="text-lg font-extrabold tracking-tight text-[var(--text)]">
+              {hasAnySale
+                ? "Nenhuma venda neste recorte"
+                : "Seu painel está pronto"}
+            </p>
+            <p className="mx-auto mt-1 max-w-md text-sm text-[var(--dim)]">
+              {hasAnySale
+                ? "Ajuste o período ou os filtros acima para ver os números do painel neste recorte."
+                : "Você já está na página do seu painel — ela só mostra os números. Para vender, abra a página de vendas e registre a venda lá: o faturamento, o gráfico e os rankings aparecem aqui."}
+            </p>
+          </div>
+        )}
+
+      {view === "painel" && hasSales && (
         <>
           {/* Gráfico por dia / mês */}
           <section className="card-glow mt-6 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-4">
@@ -3972,18 +3839,251 @@ function Tracker() {
             </section>
           )}
 
-          {/* Página de vendas: busca, filtros, tabela, paginação, CSV */}
-          <SalesPage
-            sales={sales}
-            hasAnySale={hasAnySale}
-            confirmingId={confirmingId}
-            onAskDelete={(id) => setConfirmingId(id)}
-            onCancelDelete={() => setConfirmingId(null)}
-            onConfirmDelete={(id) => deleteSale.mutate(id)}
-            deleting={deleteSale.isPending}
-          />
         </>
       )}
+    </div>
+  );
+}
+
+// ---------- demonstração pública: a página de vendas SÓ demonstra ----------
+//
+// Quem NÃO entrou vê apenas isto no lugar do sistema: um exemplo visual
+// do painel e da venda por seleção, com valores ilustrativos. A interação
+// é local (selecionar produto, ajustar quantidade, ver o total) e NÃO
+// chama o servidor, NÃO lê vendas nem estoque reais e NÃO registra nada.
+// O painel de verdade — com os dados reais da conta — só é montado
+// depois do login (ver o App: <Tracker> só renderiza com sessão válida).
+
+const DEMO_PRODUCTS: {
+  name: string;
+  detail: string;
+  priceCents: number;
+  stock: number;
+}[] = [
+  { name: "Vestido midi floral", detail: "Vestuário · M", priceCents: 12990, stock: 8 },
+  { name: "Camiseta básica", detail: "Vestuário · G", priceCents: 5990, stock: 15 },
+  { name: "Calça jeans wide leg", detail: "Vestuário · 40", priceCents: 14990, stock: 6 },
+  { name: "Jaqueta jeans", detail: "Vestuário · P", priceCents: 18990, stock: 4 },
+];
+
+const DEMO_SALES: { item: string; meta: string; totalCents: number }[] = [
+  { item: "Vestido midi floral", meta: "Gestão · WhatsApp", totalCents: 12990 },
+  { item: "Fone de ouvido bluetooth", meta: "Marketplace · Eletrônicos", totalCents: 8990 },
+  { item: "Perfume importado 100 ml", meta: "Marketplace · Imports", totalCents: 24990 },
+];
+
+const DEMO_BARS: { label: string; pct: number }[] = [
+  { label: "seg", pct: 35 },
+  { label: "ter", pct: 55 },
+  { label: "qua", pct: 42 },
+  { label: "qui", pct: 70 },
+  { label: "sex", pct: 58 },
+  { label: "sáb", pct: 88 },
+  { label: "dom", pct: 76 },
+];
+
+function DemoPanel({ onAuth }: { onAuth: (mode: AuthMode) => void }) {
+  const [selected, setSelected] = useState(0);
+  const [qty, setQty] = useState(1);
+  const [triedSell, setTriedSell] = useState(false);
+  const product = DEMO_PRODUCTS[selected] ?? DEMO_PRODUCTS[0];
+
+  return (
+    <div aria-label="Demonstração do painel">
+      <div className="flex flex-wrap items-center justify-center gap-2 text-center">
+        <span className="rounded-full border border-[var(--accent-2)] px-3 py-1 text-xs font-bold uppercase tracking-wide text-[var(--accent-2)]">
+          Demonstração
+        </span>
+        <p className="text-sm text-[var(--dim)]">
+          Valores de exemplo — o painel de verdade, com suas vendas e seu
+          estoque, só aparece depois do login.
+        </p>
+      </div>
+
+      {/* Métricas de exemplo */}
+      <section className="mt-6" aria-label="Exemplo de métricas do painel">
+        <p className="text-sm font-semibold uppercase tracking-wide text-[var(--dim)]">
+          Faturamento no período · exemplo
+        </p>
+        <p className="mt-2 text-6xl font-extrabold leading-none tracking-[-0.03em] text-[var(--text)] sm:text-7xl">
+          {formatBRL(428000)}
+        </p>
+        <div className="mt-6 grid grid-cols-3 gap-3">
+          {[
+            { label: "Itens vendidos", value: "86" },
+            { label: "Nº de vendas", value: "34" },
+            { label: "Ticket médio", value: formatBRL(12588) },
+          ].map((m) => (
+            <div
+              key={m.label}
+              className="card-glow rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-3 py-3"
+            >
+              <p className="text-2xl font-extrabold tracking-tight text-[var(--text)] sm:text-3xl">
+                {m.value}
+              </p>
+              <p className="mt-0.5 text-xs font-medium uppercase tracking-wide text-[var(--dim)]">
+                {m.label}
+              </p>
+            </div>
+          ))}
+        </div>
+        <div
+          aria-hidden="true"
+          className="card-glow mt-4 flex h-36 items-end gap-2 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-4"
+        >
+          {DEMO_BARS.map((b) => (
+            <div key={b.label} className="flex flex-1 flex-col items-center gap-2">
+              <div
+                className="w-full rounded-t-[3px] bg-[var(--chart-bar)]"
+                style={{ height: `${b.pct}%` }}
+              />
+              <span className="text-[11px] font-medium text-[var(--dim)]">
+                {b.label}
+              </span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* Venda por seleção de exemplo: interação local, nada é salvo */}
+      <section
+        className="card-glow mt-6 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] p-4"
+        aria-label="Exemplo de registrar venda"
+      >
+        <h3 className="text-xl font-extrabold tracking-tight text-[var(--text)]">
+          Registrar venda — exemplo
+        </h3>
+        <p className="mt-1 text-sm text-[var(--dim)]">
+          No painel de verdade é assim: toque no produto, ajuste a
+          quantidade e confirme — a venda entra e o estoque baixa sozinho.
+          Experimente aqui: é só demonstração, nada fica salvo.
+        </p>
+        <div
+          className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4"
+          role="group"
+          aria-label="Produtos de exemplo"
+        >
+          {DEMO_PRODUCTS.map((p, i) => (
+            <button
+              key={p.name}
+              type="button"
+              aria-pressed={selected === i}
+              onClick={() => {
+                setSelected(i);
+                setQty(1);
+                setTriedSell(false);
+              }}
+              className={`rounded-[var(--radius-sm)] border p-3 text-left ${
+                selected === i
+                  ? "btn-glow border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-ink)]"
+                  : "border-[var(--border)] bg-[var(--surface-alt)] text-[var(--text)]"
+              }`}
+            >
+              <span className="block truncate text-sm font-bold">{p.name}</span>
+              <span
+                className={`mt-0.5 block text-xs ${selected === i ? "" : "text-[var(--dim)]"}`}
+              >
+                {p.detail}
+              </span>
+              <span className="mt-1.5 block text-sm font-extrabold">
+                {formatBRL(p.priceCents)}
+              </span>
+              <span
+                className={`mt-0.5 block text-xs font-semibold ${selected === i ? "" : "text-[var(--dim)]"}`}
+              >
+                {p.stock} em estoque
+              </span>
+            </button>
+          ))}
+        </div>
+        {product && (
+          <div className="mt-4 flex flex-wrap items-center gap-4">
+            <div
+              className="flex items-center gap-2"
+              role="group"
+              aria-label="Quantidade do exemplo"
+            >
+              <button
+                type="button"
+                aria-label="Diminuir quantidade do exemplo"
+                onClick={() => setQty((q) => Math.max(1, q - 1))}
+                className="h-10 w-10 rounded-full border border-[var(--border)] bg-[var(--surface)] text-lg font-bold text-[var(--text)]"
+              >
+                −
+              </button>
+              <span className="min-w-8 text-center text-lg font-extrabold text-[var(--text)]">
+                {qty}
+              </span>
+              <button
+                type="button"
+                aria-label="Aumentar quantidade do exemplo"
+                onClick={() => setQty((q) => Math.min(product.stock, q + 1))}
+                className="h-10 w-10 rounded-full border border-[var(--border)] bg-[var(--surface)] text-lg font-bold text-[var(--text)]"
+              >
+                +
+              </button>
+            </div>
+            <p className="text-2xl font-extrabold tracking-tight text-[var(--text)]">
+              {formatBRL(product.priceCents * qty)}
+            </p>
+          </div>
+        )}
+        <button
+          type="button"
+          onClick={() => setTriedSell(true)}
+          className="btn-glow mt-4 w-full rounded-full bg-[var(--accent)] px-4 py-3 text-base font-semibold text-[var(--accent-ink)]"
+        >
+          Confirmar venda
+        </button>
+        {triedSell && (
+          <p role="status" className="mt-3 text-sm font-medium text-[var(--accent-2)]">
+            Viu como é rápido? Isso foi só a demonstração — para registrar
+            vendas de verdade, entre na sua conta ou crie uma agora.
+          </p>
+        )}
+      </section>
+
+      {/* Lista de vendas de exemplo */}
+      <section className="mt-6" aria-label="Exemplo de lista de vendas">
+        <h3 className="text-xl font-extrabold tracking-tight text-[var(--text)]">
+          Suas vendas, uma por uma — exemplo
+        </h3>
+        <ul className="card-glow mt-3 divide-y divide-[var(--border)] rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)]">
+          {DEMO_SALES.map((s) => (
+            <li
+              key={s.item}
+              className="flex items-center justify-between gap-3 px-4 py-3"
+            >
+              <div className="min-w-0">
+                <p className="truncate text-base font-medium text-[var(--text)]">
+                  {s.item}
+                </p>
+                <p className="mt-0.5 text-xs text-[var(--dim)]">{s.meta}</p>
+              </div>
+              <p className="shrink-0 text-lg font-extrabold tracking-tight text-[var(--text)]">
+                {formatBRL(s.totalCents)}
+              </p>
+            </li>
+          ))}
+        </ul>
+      </section>
+
+      <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
+        <button
+          type="button"
+          onClick={() => onAuth("conta")}
+          className="btn-glow w-full rounded-full bg-[var(--accent)] px-8 py-4 text-base font-semibold text-[var(--accent-ink)] sm:w-auto"
+        >
+          Criar conta e abrir meu painel
+        </button>
+        <button
+          type="button"
+          onClick={() => onAuth("entrar")}
+          className="w-full rounded-full border border-[var(--border)] bg-transparent px-8 py-4 text-base font-semibold text-[var(--text)] sm:w-auto"
+        >
+          Entrar no meu painel
+        </button>
+      </div>
     </div>
   );
 }
@@ -4282,18 +4382,119 @@ function FaqItem({ q, a }: { q: string; a: string }) {
 
 // ---------- navegação flutuante em pílula ----------
 
+/**
+ * Barra de PÁGINAS do app: Página inicial × Painel × Página de vendas.
+ * Cada uma é uma página separada, com endereço próprio (#/, #/painel,
+ * #/vendas) — não é aba nem seção da mesma página.
+ */
+function PageNav({
+  current,
+  onNavigate,
+}: {
+  current: AppPage;
+  onNavigate: (page: AppPage) => void;
+}) {
+  const items: { key: AppPage; label: string }[] = [
+    { key: "inicio", label: "Página inicial" },
+    { key: "painel", label: "Painel" },
+    { key: "vendas", label: "Página de vendas" },
+  ];
+  return (
+    <nav
+      aria-label="Páginas do app"
+      className="mb-6 flex gap-2 rounded-full border border-[var(--border)] bg-[var(--surface)] p-1.5"
+    >
+      {items.map((item) => (
+        <button
+          key={item.key}
+          type="button"
+          aria-current={current === item.key ? "page" : undefined}
+          aria-label={
+            item.key === "painel"
+              ? "Ir para a página do painel"
+              : item.key === "vendas"
+                ? "Ir para a página de vendas"
+                : "Ir para a página inicial"
+          }
+          onClick={() => onNavigate(item.key)}
+          className={`flex-1 rounded-full px-3 py-2.5 text-sm font-bold ${
+            current === item.key
+              ? "btn-glow bg-[var(--accent)] text-[var(--accent-ink)]"
+              : "text-[var(--text)]"
+          }`}
+        >
+          {item.label}
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+/** Porta de entrada do painel/vendas para quem ainda não entrou. */
+function PageLoginGate({
+  title,
+  text,
+  onAuth,
+  onGoHome,
+}: {
+  title: string;
+  text: string;
+  onAuth: (mode: AuthMode) => void;
+  onGoHome: () => void;
+}) {
+  return (
+    <div className="card-glow rounded-[var(--radius)] border border-dashed border-[var(--accent-2)] bg-[var(--surface)] p-6 text-center">
+      <h2 className="text-2xl font-extrabold tracking-tight text-[var(--text)]">
+        {title}
+      </h2>
+      <p className="mx-auto mt-2 max-w-md text-sm leading-relaxed text-[var(--dim)]">
+        {text}
+      </p>
+      <div className="mt-5 flex flex-col justify-center gap-3 sm:flex-row">
+        <button
+          type="button"
+          onClick={() => onAuth("entrar")}
+          className="btn-glow rounded-full bg-[var(--accent)] px-6 py-3 text-base font-semibold text-[var(--accent-ink)]"
+        >
+          Entrar na minha conta
+        </button>
+        <button
+          type="button"
+          onClick={() => onAuth("conta")}
+          className="rounded-full border border-[var(--border)] px-6 py-3 text-base font-semibold text-[var(--text)]"
+        >
+          Criar conta
+        </button>
+        <button
+          type="button"
+          onClick={onGoHome}
+          className="rounded-full px-6 py-3 text-base font-semibold text-[var(--dim)] underline"
+        >
+          Voltar à página inicial
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function TopNav({
   onNavigate,
   onAuth,
+  currentPage,
 }: {
   onNavigate?: (id: string) => void;
   onAuth?: (mode: AuthMode) => void;
+  currentPage?: AppPage;
 }) {
+  // Painel e Vendas são PÁGINAS separadas: Painel abre a página do
+  // dashboard (#/painel); Vendas abre a página de vendas (#/vendas).
+  // Nichos e FAQ são seções da página inicial; Entrar/Criar conta abrem
+  // a página de acesso (#/auth).
   const links: { id: string; label: string; hideOnMobile?: boolean }[] = [
-    { id: "conta", label: "Conta", hideOnMobile: true },
-    { id: "sistema", label: "Painel" },
+    { id: "inicio", label: "Início", hideOnMobile: true },
+    { id: "painel", label: "Painel" },
+    { id: "vendas", label: "Vendas", hideOnMobile: true },
     { id: "nichos", label: "Nichos", hideOnMobile: true },
-    { id: "admin", label: "ADM", hideOnMobile: true },
     { id: "faq", label: "FAQ", hideOnMobile: true },
   ];
   const go = (id: string) => {
@@ -4322,24 +4523,33 @@ function TopNav({
             className="h-6 w-auto sm:h-7"
           />
         </button>
-        {links.map((l) => (
-          <button
-            key={l.id}
-            type="button"
-            onClick={() => go(l.id)}
-            className={`rounded-full px-3.5 py-2 text-sm font-semibold text-[var(--text)] transition-colors hover:bg-[var(--surface-alt)] ${
-              l.hideOnMobile ? "hidden sm:block" : ""
-            }`}
-          >
-            {l.label}
-          </button>
-        ))}
+        {links.map((l) => {
+          const isCurrentPage =
+            (l.id === "painel" && currentPage === "painel") ||
+            (l.id === "vendas" && currentPage === "vendas") ||
+            (l.id === "inicio" && currentPage === "inicio");
+          return (
+            <button
+              key={l.id}
+              type="button"
+              aria-current={isCurrentPage ? "page" : undefined}
+              onClick={() => go(l.id)}
+              className={`rounded-full px-3.5 py-2 text-sm font-semibold transition-colors hover:bg-[var(--surface-alt)] ${
+                isCurrentPage
+                  ? "bg-[var(--surface-alt)] text-[var(--accent-2)]"
+                  : "text-[var(--text)]"
+              } ${l.hideOnMobile ? "hidden sm:block" : ""}`}
+            >
+              {l.label}
+            </button>
+          );
+        })}
         <button
           type="button"
           onClick={(e) => {
             e.preventDefault();
             if (onAuth) onAuth("entrar");
-            else go("entrar");
+            else go("acesso");
           }}
           className="whitespace-nowrap rounded-full border border-[var(--accent)] px-4 py-2 text-sm font-semibold text-[var(--text)]"
         >
@@ -4350,7 +4560,7 @@ function TopNav({
           onClick={(e) => {
             e.preventDefault();
             if (onAuth) onAuth("conta");
-            else go("conta");
+            else go("acesso");
           }}
           className="btn-glow whitespace-nowrap rounded-full bg-[var(--accent)] px-5 py-2.5 text-sm font-bold text-[var(--accent-ink)]"
         >
@@ -4419,11 +4629,55 @@ export function App() {
   const [nicheView, setNicheView] = useState<string | null>(null);
   const activeNiche = nicheView ? nichePageOf(nicheView) : undefined;
 
-  // Entrar / Criar conta abrem numa janela sobre a página atual — nunca
-  // numa nova aba.
-  const [authMode, setAuthMode] = useState<AuthMode | null>(null);
-  const openAuth = useCallback((mode: AuthMode) => setAuthMode(mode), []);
-  const closeAuth = useCallback(() => setAuthMode(null), []);
+  // PÁGINAS do app — cada uma separada, com endereço próprio:
+  // "inicio" (#/) é a página inicial (apresentação + demonstração);
+  // "painel" (#/painel) é a página SÓ do dashboard funcional (métricas,
+  // gráficos e dados do cliente logado); "vendas" (#/vendas) é a página
+  // de vendas. Criar conta / entrar cai SEMPRE na página do painel.
+  const [appPage, setAppPage] = useState<AppPage>(() => pageFromHash());
+
+  // O endereço (#/painel, #/vendas) e a página aberta andam juntos:
+  // voltar/avançar do navegador troca de página de verdade.
+  useEffect(() => {
+    function onHash() {
+      setAppPage(pageFromHash());
+    }
+    window.addEventListener("hashchange", onHash);
+    return () => window.removeEventListener("hashchange", onHash);
+  }, []);
+
+  const goPage = useCallback((page: AppPage) => {
+    setNicheView(null);
+    setAppPage(page);
+    const target = hashForPage(page);
+    if (window.location.hash !== target) {
+      window.location.hash = target;
+    }
+    window.scrollTo({ top: 0 });
+  }, []);
+
+  // Entrar / Criar conta abrem a PÁGINA DE ACESSO (#/auth) — página
+  // dedicada e limpa, no mesmo app (nada de nova aba do navegador).
+  // authMode diz se ela abre em "entrar" ou em "conta" (cadastro).
+  const [authMode, setAuthMode] = useState<AuthMode>("entrar");
+  const openAuth = useCallback(
+    (mode: AuthMode) => {
+      setAuthMode(mode);
+      goPage("auth");
+    },
+    [goPage],
+  );
+
+  // Pedidos de "abrir a conta" vindos de dentro das páginas (goConta, no
+  // painel) chegam por evento: a conta abre sempre na página de acesso.
+  useEffect(() => {
+    function onOpenAuth(e: Event) {
+      const mode = (e as CustomEvent<string>).detail;
+      openAuth(mode === "entrar" ? "entrar" : "conta");
+    }
+    window.addEventListener("pingcou:open-auth", onOpenAuth);
+    return () => window.removeEventListener("pingcou:open-auth", onOpenAuth);
+  }, [openAuth]);
 
   // Sessão de login (e-mail + token), lembrada neste aparelho.
   const [session, setSession] = useState<LoginSession | null>(() => {
@@ -4438,16 +4692,26 @@ export function App() {
       return null;
     }
   });
-  const handleLogin = useCallback((email: string, token: string | null) => {
-    if (!token) return;
-    const next = { email, token };
-    setSession(next);
-    try {
-      window.localStorage.setItem(LOGIN_SESSION_KEY, JSON.stringify(next));
-    } catch {
-      // Sem armazenamento disponível: a sessão vale só nesta visita.
-    }
-  }, []);
+  // "Lembrar acesso" marcado: a sessão fica salva neste aparelho e a
+  // pessoa entra direto nas próximas visitas. Desmarcado: a sessão vale
+  // só nesta visita e nada fica salvo.
+  const handleLogin = useCallback(
+    (email: string, token: string | null, remember = true) => {
+      if (!token) return;
+      const next = { email, token };
+      setSession(next);
+      try {
+        if (remember) {
+          window.localStorage.setItem(LOGIN_SESSION_KEY, JSON.stringify(next));
+        } else {
+          window.localStorage.removeItem(LOGIN_SESSION_KEY);
+        }
+      } catch {
+        // Sem armazenamento disponível: a sessão vale só nesta visita.
+      }
+    },
+    [],
+  );
   const handleLogout = useCallback(() => {
     setSession(null);
     try {
@@ -4457,41 +4721,281 @@ export function App() {
     }
   }, []);
 
+  // Ir para a PÁGINA DO PAINEL (dashboard) — página própria, separada da
+  // página inicial e da página de vendas. É o destino de quem acabou de
+  // criar a conta ou de entrar.
+  const goPainel = useCallback(() => {
+    goPage("painel");
+  }, [goPage]);
+
+  // Ir para a PÁGINA DE VENDAS — página própria, separada do painel.
+  const goVendas = useCallback(() => {
+    goPage("vendas");
+  }, [goPage]);
+
+  // Ir para a PÁGINA INICIAL — apresentação e demonstração, sem painel.
+  const goInicio = useCallback(() => {
+    goPage("inicio");
+  }, [goPage]);
+
+  // Login feito: abre a sessão, BUSCA os dados do cliente (perfil com o
+  // nicho da conta) e vai direto para o painel — que abre configurado
+  // para esse nicho (nome, nicho, categorias e filtros dele).
+  const queryClient = useQueryClient();
+
+  // Login de verdade = sessão salva NESTE aparelho E token ainda válido
+  // no servidor. Só com login o painel funcional (dados reais) é montado;
+  // sem login, a página mostra apenas a demonstração (DemoPanel).
+  const sessionCheck = useQuery({
+    queryKey: ["session", session?.email, session?.token],
+    queryFn: () =>
+      api.checkSession({
+        email: session?.email ?? "",
+        sessionToken: session?.token ?? "",
+      }),
+    enabled: Boolean(session),
+  });
+  const loggedIn = Boolean(session && sessionCheck.data?.profile);
+  const sessionChecking = Boolean(session) && sessionCheck.isPending;
+
+  const handleLoggedIn = useCallback(
+    (email: string, token: string | null, remember = true) => {
+      if (!token) return;
+      handleLogin(email, token, remember);
+      queryClient.invalidateQueries({ queryKey: ["profile"] });
+      queryClient.invalidateQueries({ queryKey: ["session"] });
+      goPainel();
+    },
+    [handleLogin, goPainel, queryClient],
+  );
+
+  // Conta salva: na CRIAÇÃO, entra automaticamente (sessão aberta com o
+  // token que voltou do salvamento, sem pedir login) e vai direto para o
+  // painel — nunca para a página de vendas. Ao só editar a conta, fica
+  // onde está.
+  const handleAccountSaved = useCallback(
+    (email: string, token: string | null, wasCreation: boolean) => {
+      if (!token) return;
+      handleLogin(email, token);
+      // Dados frescos do cliente para o painel abrir já no nicho da conta.
+      queryClient.invalidateQueries({ queryKey: ["profile"] });
+      queryClient.invalidateQueries({ queryKey: ["session"] });
+      if (wasCreation) goPainel();
+    },
+    [handleLogin, goPainel, queryClient],
+  );
+
   function openNiche(key: string) {
+    // A página do nicho é funcional (estoque e venda reais): só abre
+    // depois do login. Sem login, pede para entrar/criar a conta.
+    if (!loggedIn) {
+      openAuth("conta");
+      return;
+    }
     setNicheView(key);
     window.scrollTo({ top: 0 });
   }
 
   function navigateFromNiche(id: string) {
-    setNicheView(null);
-    if (id === "topo") {
-      window.scrollTo({ top: 0, behavior: "smooth" });
+    if (id === "painel" || id === "sistema") {
+      goPainel();
       return;
     }
-    window.setTimeout(() => scrollToId(id), 60);
+    if (id === "vendas") {
+      goVendas();
+      return;
+    }
+    setNicheView(null);
+    if (id === "topo" || id === "inicio") {
+      goInicio();
+      return;
+    }
+    // Seções (Nichos, FAQ) moram na página inicial.
+    goInicio();
+    window.setTimeout(() => scrollToId(id), 80);
   }
 
-  const authModal = authMode ? (
-    <AuthModal
-      mode={authMode}
-      onModeChange={setAuthMode}
-      onClose={closeAuth}
-      session={session}
-      onLogin={handleLogin}
-      onLogout={handleLogout}
-    />
-  ) : null;
+  // Navegação principal: Painel e Vendas abrem as PÁGINAS deles; Início
+  // volta para a página inicial; os demais destinos são seções da
+  // página inicial (se estiver noutra página, volta para ela e rola).
+  function navigateMain(id: string) {
+    if (id === "topo" || id === "inicio") {
+      if (appPage !== "inicio") {
+        goInicio();
+      } else {
+        window.scrollTo({ top: 0, behavior: "smooth" });
+      }
+      return;
+    }
+    if (id === "painel" || id === "sistema") {
+      goPainel();
+      return;
+    }
+    if (id === "vendas") {
+      goVendas();
+      return;
+    }
+    if (appPage !== "inicio") {
+      goInicio();
+      window.setTimeout(() => scrollToId(id), 80);
+      return;
+    }
+    scrollToId(id);
+  }
 
-  if (activeNiche) {
+  // ---------- PÁGINA DE ACESSO (#/auth) — página separada ----------
+  //
+  // Página dedicada e limpa de autenticação: sem TopNav, sem
+  // demonstração e sem painel. Entrar ou criar a conta leva direto para
+  // a página do painel; "Conhecer o Pingou Venda →" volta para a pública.
+  if (appPage === "auth") {
     return (
       <div className="min-h-screen bg-[var(--bg)]">
         <SafeAreaTopScrim backgroundColor="var(--bg)" />
-        <TopNav onNavigate={navigateFromNiche} onAuth={openAuth} />
+        {sessionChecking ? (
+          <main className="mx-auto w-full max-w-md px-4 pb-16 pt-16">
+            <img
+              src={logoPingcou}
+              alt="Pingou Venda"
+              className="mx-auto w-[210px] max-w-[70vw]"
+            />
+            <p className="mt-10 text-center text-sm text-[var(--dim)]">
+              Verificando seu acesso…
+            </p>
+          </main>
+        ) : (
+          <AuthPage
+            mode={authMode}
+            onModeChange={setAuthMode}
+            profile={sessionCheck.data?.profile ?? null}
+            onLogin={handleLoggedIn}
+            onAccountCreated={handleAccountSaved}
+            onLogout={handleLogout}
+            onGoPanel={goPainel}
+            onGoHome={goInicio}
+          />
+        )}
+      </div>
+    );
+  }
+
+  if (activeNiche && loggedIn) {
+    return (
+      <div className="min-h-screen bg-[var(--bg)]">
+        <SafeAreaTopScrim backgroundColor="var(--bg)" />
+        <TopNav
+          onNavigate={navigateFromNiche}
+          onAuth={openAuth}
+          currentPage={appPage}
+        />
         <main>
           <NichePage niche={activeNiche} onBack={() => setNicheView(null)} />
         </main>
         <SiteFooter />
-        {authModal}
+      </div>
+    );
+  }
+
+  // ---------- PÁGINA DO PAINEL (dashboard) — página separada ----------
+  //
+  // Esta página é SÓ o painel funcional: métricas, gráficos e os dados
+  // do cliente logado (conta, nicho, período grátis). Não tem página
+  // inicial, não tem demonstração e não tem nada de vender — registrar
+  // venda mora na página de vendas (#/vendas).
+  if (appPage === "painel") {
+    return (
+      <div className="min-h-screen bg-[var(--bg)]">
+        <SafeAreaTopScrim backgroundColor="var(--bg)" />
+        <TopNav
+          onNavigate={navigateMain}
+          onAuth={openAuth}
+          currentPage="painel"
+        />
+        <main className="mx-auto w-full max-w-6xl px-4 pb-16 pt-28 sm:pt-32">
+          <div className="mx-auto max-w-3xl">
+            <PillBadge>Painel · dashboard</PillBadge>
+            <h1 className="t-display mt-4 text-[var(--text)]">
+              Seu painel,{" "}
+              <span className="font-accent-word">só os números.</span>
+            </h1>
+            <p className="mt-3 max-w-2xl text-base leading-relaxed text-[var(--dim)]">
+              Página separada do painel: faturamento, gráfico, categorias,
+              canais e ranking da Gestão e do Marketplace, com os dados da
+              sua conta. Aqui não se vende — para registrar venda, abra a
+              página de vendas.
+            </p>
+            <div className="mt-8">
+              <PageNav current="painel" onNavigate={goPage} />
+            </div>
+            {sessionChecking ? (
+              <p className="text-center text-sm text-[var(--dim)]">
+                Verificando seu acesso…
+              </p>
+            ) : loggedIn ? (
+              <Tracker view="painel" />
+            ) : (
+              <PageLoginGate
+                title="Entre para abrir o seu painel"
+                text="O painel de verdade — com as suas vendas, o seu nicho e os seus números — é uma página separada e só aparece para quem entrou na conta. A demonstração fica na página inicial."
+                onAuth={openAuth}
+                onGoHome={goInicio}
+              />
+            )}
+          </div>
+        </main>
+        <SiteFooter />
+      </div>
+    );
+  }
+
+  // ---------- PÁGINA DE VENDAS — página separada ----------
+  //
+  // Esta página é SÓ para vender: registrar venda por seleção (com
+  // baixa automática no estoque), montar o estoque e ver a lista
+  // completa das vendas. Não tem métrica, gráfico nem ranking — isso é
+  // da página do painel (#/painel).
+  if (appPage === "vendas") {
+    return (
+      <div className="min-h-screen bg-[var(--bg)]">
+        <SafeAreaTopScrim backgroundColor="var(--bg)" />
+        <TopNav
+          onNavigate={navigateMain}
+          onAuth={openAuth}
+          currentPage="vendas"
+        />
+        <main className="mx-auto w-full max-w-6xl px-4 pb-16 pt-28 sm:pt-32">
+          <div className="mx-auto max-w-3xl">
+            <PillBadge>Página de vendas</PillBadge>
+            <h1 className="t-display mt-4 text-[var(--text)]">
+              Vender e acompanhar{" "}
+              <span className="font-accent-word">cada venda.</span>
+            </h1>
+            <p className="mt-3 max-w-2xl text-base leading-relaxed text-[var(--dim)]">
+              Página separada de vendas: registre a venda por seleção, com
+              baixa automática no estoque, e veja a lista completa das suas
+              vendas, uma por uma. Os números e gráficos ficam na página do
+              painel.
+            </p>
+            <div className="mt-8">
+              <PageNav current="vendas" onNavigate={goPage} />
+            </div>
+            {sessionChecking ? (
+              <p className="text-center text-sm text-[var(--dim)]">
+                Verificando seu acesso…
+              </p>
+            ) : loggedIn ? (
+              <Tracker view="vendas" />
+            ) : (
+              <PageLoginGate
+                title="Entre para abrir a página de vendas"
+                text="A página de vendas de verdade — registrar venda, estoque e a lista das suas vendas — só aparece para quem entrou na conta. Na página inicial tem só a demonstração."
+                onAuth={openAuth}
+                onGoHome={goInicio}
+              />
+            )}
+          </div>
+        </main>
+        <SiteFooter />
       </div>
     );
   }
@@ -4499,8 +5003,7 @@ export function App() {
   return (
     <div className="min-h-screen bg-[var(--bg)]">
       <SafeAreaTopScrim backgroundColor="var(--bg)" />
-      <TopNav onAuth={openAuth} />
-      {authModal}
+      <TopNav onNavigate={navigateMain} onAuth={openAuth} currentPage="inicio" />
 
       {/* Herói — fundo com grade de pontinhos dourados e brilhos radiais */}
       <div className="hero-top">
@@ -4533,10 +5036,10 @@ export function App() {
             </button>
             <button
               type="button"
-              onClick={() => goSistema()}
+              onClick={loggedIn ? goPainel : () => scrollToId("sistema")}
               className="w-full rounded-full border border-[var(--border)] bg-transparent px-8 py-4 text-base font-semibold text-[var(--text)] sm:w-auto"
             >
-              Ver o painel ↓
+              {loggedIn ? "Ir para o meu painel" : "Ver a demonstração ↓"}
             </button>
           </div>
           <HeroShowcase />
@@ -4560,53 +5063,61 @@ export function App() {
         ]}
       />
 
-      {/* Criação de conta — o nicho aparece já no cadastro */}
+      {/* Acesso: a página pública NÃO tem formulário de cadastro nem de
+          login embutido. Aqui ficam só os dois botões — Criar conta e
+          Entrar — que abrem a página de autenticação (#/auth). */}
       <section
-        id="conta"
+        id="acesso"
         className="mx-auto w-full max-w-6xl scroll-mt-24 px-4 py-16 sm:py-20"
       >
         <SectionHeading
-          kicker="Crie sua conta"
+          kicker="Crie sua conta ou entre"
           title={
             <>
               Sua conta já nasce{" "}
               <span className="font-accent-word">no seu nicho.</span>
             </>
           }
-          sub="Nada de painel genérico igual para todo mundo: ao criar a conta, você escolhe o nicho do seu negócio e o painel já abre organizado — categorias, filtros e textos do seu nicho."
+          sub="Nada de painel genérico igual para todo mundo: ao criar a conta, você escolhe o nicho do seu negócio e o painel já abre organizado — categorias, filtros e textos do seu nicho. Criar conta e entrar acontecem na página de acesso, separada desta demonstração."
         />
-        <div className="mx-auto mt-12 max-w-3xl">
-          <div id="entrar" className="scroll-mt-28">
-            <LoginCard
-              session={session}
-              onLogin={handleLogin}
-              onLogout={handleLogout}
-            />
-          </div>
-          <div className="mt-6">
-            <OnboardingCard onAccountSaved={handleLogin} />
-          </div>
+        <div className="mx-auto mt-10 flex max-w-xl flex-col items-center justify-center gap-3 sm:flex-row">
+          <button
+            type="button"
+            onClick={() => openAuth("conta")}
+            className="btn-glow w-full rounded-full bg-[var(--accent)] px-8 py-4 text-base font-semibold text-[var(--accent-ink)] sm:w-auto"
+          >
+            Criar conta
+          </button>
+          <button
+            type="button"
+            onClick={() => openAuth("entrar")}
+            className="w-full rounded-full border border-[var(--border)] bg-transparent px-8 py-4 text-base font-semibold text-[var(--text)] sm:w-auto"
+          >
+            Entrar
+          </button>
         </div>
       </section>
 
-      {/* Sistema ao vivo */}
+      {/* Páginas do app: a inicial NÃO embute painel nem vendas — cada
+          um mora na página dele (#/painel e #/vendas). Aqui ficam só as
+          portas de entrada e, para quem não entrou, a demonstração. */}
       <section
         id="sistema"
         className="scroll-mt-20 border-y border-[var(--border)] bg-[var(--surface)] py-16 sm:py-20"
       >
         <div className="mx-auto w-full max-w-6xl px-4">
           <SectionHeading
-            kicker="Seu painel"
+            kicker="Demonstração do app"
             title={
               <>
-                Um painel. Duas frentes.{" "}
-                <span className="font-accent-word">Todos os nichos.</span>
+                É assim que o seu painel fica —{" "}
+                <span className="font-accent-word">por dentro.</span>
               </>
             }
-            sub="É aqui que você trabalha: a Gestão acompanha as vendas locais e o Marketplace soma as vendas de cada nicho — tudo separado, com faturamento, gráfico, categorias, canais, ranking e a página de vendas completa, com busca, filtros, ordenação e exportação."
+            sub="Esta página é só demonstração: ela mostra o que o app faz, com exemplos visuais — mas não é o painel. O painel de verdade é uma página separada, com as suas vendas e os seus números, e só aparece depois que você entra na sua conta."
           />
           <div className="mx-auto mt-12 max-w-3xl">
-            <Tracker />
+            <DemoPanel onAuth={openAuth} />
           </div>
         </div>
       </section>
@@ -4627,49 +5138,10 @@ export function App() {
           sub="Imports, vestuário e eletrônicos: cada nicho abre numa página própria, com a seleção dele, o estoque que você monta em toques e a venda por seleção — sem digitar produto por produto."
         />
         <div className="mt-12">
-          <NicheHub onOpen={openNiche} />
-        </div>
-      </section>
-
-      {/* Aba Revenda */}
-      <section
-        id="revenda"
-        className="scroll-mt-20 border-y border-[var(--border)] bg-[var(--surface)] py-16 sm:py-20"
-      >
-        <div className="mx-auto w-full max-w-6xl px-4">
-          <SectionHeading
-            kicker="Revenda"
-            title={
-              <>
-                Revenda com acesso{" "}
-                <span className="font-accent-word">só ao que pode.</span>
-              </>
-            }
-            sub="Quem revende entra com o e-mail cadastrado e vê um painel enxuto: só os produtos liberados para revenda, com preço e estoque. Quer revender? O cadastro avisa a Pingou Venda na hora."
-          />
-          <div className="mx-auto mt-12 max-w-4xl">
-            <RevendaView />
-          </div>
-        </div>
-      </section>
-
-      {/* ADM da dona */}
-      <section
-        id="admin"
-        className="mx-auto w-full max-w-6xl scroll-mt-24 px-4 py-16 sm:py-20"
-      >
-        <SectionHeading
-          kicker="ADM"
-          title={
-            <>
-              O controle é{" "}
-              <span className="font-accent-word">da dona.</span>
-            </>
-          }
-          sub="Área protegida por código: altere o e-mail da conta e das pessoas, cadastre vendedores e revendedores, estenda o período grátis e receba os avisos de cadastro com som."
-        />
-        <div className="mx-auto mt-12 max-w-4xl">
-          <AdminView />
+          {/* Na página pública o hub de nichos é só demonstração: mostra
+              categorias e sugestões do catálogo e o botão leva para a
+              página de acesso — nenhum estoque real é lido aqui. */}
+          <NicheHub onOpen={openNiche} loggedIn={false} onAuth={openAuth} />
         </div>
       </section>
 
